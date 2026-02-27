@@ -18,6 +18,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 MAX_TELEGRAM_TEXT = 4096
 
 
+def log(msg: str) -> None:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
+
 def env(name: str, default: Optional[str] = None) -> Optional[str]:
     value = os.getenv(name)
     if value is None:
@@ -92,13 +97,35 @@ class TelegramAPI:
             payload["offset"] = offset
         return self._request("getUpdates", payload)
 
-    def send_message(self, chat_id: int, text: str, reply_to: Optional[int] = None) -> None:
+    def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        reply_to: Optional[int] = None,
+        reply_markup: Optional[Dict[str, Any]] = None,
+    ) -> None:
         payload: Dict[str, Any] = {"chat_id": chat_id, "text": text}
         if reply_to is not None:
             payload["reply_to_message_id"] = reply_to
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         for part in chunk_text(text, size=min(3800, MAX_TELEGRAM_TEXT)):
             payload["text"] = part
             self._request("sendMessage", payload)
+
+    def answer_callback_query(
+        self,
+        callback_query_id: str,
+        text: Optional[str] = None,
+        show_alert: bool = False,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "callback_query_id": callback_query_id,
+            "show_alert": show_alert,
+        }
+        if text:
+            payload["text"] = text
+        self._request("answerCallbackQuery", payload)
 
 
 @dataclass
@@ -136,6 +163,40 @@ class SessionStore:
             if meta and meta.session_id == session_id:
                 return meta
         return None
+
+    def get_history(
+        self,
+        session_id: str,
+        limit: int = 10,
+    ) -> Tuple[Optional[SessionMeta], List[Tuple[str, str]]]:
+        meta = self.find_by_id(session_id)
+        if not meta:
+            return None, []
+        path = Path(meta.file_path)
+        messages: List[Tuple[str, str]] = []
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        evt = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if evt.get("type") != "event_msg":
+                        continue
+                    payload = evt.get("payload") or {}
+                    msg_type = payload.get("type")
+                    if msg_type not in ("user_message", "agent_message"):
+                        continue
+                    message = (payload.get("message") or "").strip()
+                    if not message:
+                        continue
+                    role = "user" if msg_type == "user_message" else "assistant"
+                    messages.append((role, message))
+        except Exception:
+            return meta, []
+        if limit > 0:
+            messages = messages[-limit:]
+        return meta, messages
 
     @staticmethod
     def _parse_session_meta(path: Path) -> Optional[SessionMeta]:
@@ -187,6 +248,13 @@ class SessionStore:
 
     @staticmethod
     def _compact_title(text: str, limit: int = 46) -> str:
+        one_line = " ".join(text.split())
+        if len(one_line) <= limit:
+            return one_line
+        return one_line[: limit - 1] + "…"
+
+    @staticmethod
+    def compact_message(text: str, limit: int = 320) -> str:
         one_line = " ".join(text.split())
         if len(one_line) <= limit:
             return one_line
@@ -248,6 +316,15 @@ class BotState:
         if not isinstance(values, list):
             return []
         return [str(v) for v in values]
+
+    def set_pending_session_pick(self, user_id: int, enabled: bool) -> None:
+        user_data = self.get_user(user_id)
+        user_data["pending_session_pick"] = bool(enabled)
+        self.save()
+
+    def is_pending_session_pick(self, user_id: int) -> bool:
+        user_data = self.get_user(user_id)
+        return bool(user_data.get("pending_session_pick"))
 
 
 class CodexRunner:
@@ -355,6 +432,11 @@ class TgCodexService:
                 time.sleep(2)
 
     def _handle_update(self, update: Dict[str, Any]) -> None:
+        callback_query = update.get("callback_query")
+        if callback_query:
+            self._handle_callback_query(callback_query)
+            return
+
         msg = update.get("message")
         if not msg:
             return
@@ -367,18 +449,27 @@ class TgCodexService:
 
         if user_id is None:
             return
+        log(
+            f"update received: user_id={user_id} chat_id={chat_id} "
+            f"text={text[:80]!r}"
+        )
 
         if self.allowed_user_ids is not None and int(user_id) not in self.allowed_user_ids:
+            log(f"blocked by allowlist: user_id={user_id}")
             self.api.send_message(chat_id, "没有权限使用这个 bot。", reply_to=message_id)
             return
 
         if not text:
             return
         if not text.startswith("/"):
+            if self._try_handle_quick_session_pick(chat_id, message_id, int(user_id), text):
+                return
+            self.state.set_pending_session_pick(int(user_id), False)
             self._handle_chat_message(chat_id, message_id, int(user_id), text)
             return
 
         cmd, arg = self._parse_command(text)
+        log(f"command: /{cmd} arg={arg[:80]!r}")
         if cmd in ("start", "help"):
             self._send_help(chat_id, message_id)
             return
@@ -394,11 +485,41 @@ class TgCodexService:
         if cmd == "new":
             self._handle_new(chat_id, message_id, int(user_id), arg)
             return
+        if cmd == "history":
+            self._handle_history(chat_id, message_id, int(user_id), arg)
+            return
         if cmd == "ask":
             self._handle_ask(chat_id, message_id, int(user_id), arg)
             return
 
         self.api.send_message(chat_id, f"未知命令: /{cmd}\n发送 /help 查看说明。", reply_to=message_id)
+
+    def _handle_callback_query(self, callback_query: Dict[str, Any]) -> None:
+        cq_id = callback_query.get("id")
+        data = (callback_query.get("data") or "").strip()
+        msg = callback_query.get("message") or {}
+        chat = msg.get("chat") or {}
+        chat_id = chat.get("id")
+        reply_to = msg.get("message_id")
+        user = callback_query.get("from") or {}
+        user_id = user.get("id")
+
+        if not cq_id or user_id is None:
+            return
+        if self.allowed_user_ids is not None and int(user_id) not in self.allowed_user_ids:
+            self.api.answer_callback_query(cq_id, text="没有权限。", show_alert=True)
+            return
+        if not isinstance(chat_id, int):
+            self.api.answer_callback_query(cq_id, text="无法解析聊天上下文。", show_alert=True)
+            return
+
+        if data.startswith("use:"):
+            session_id = data[4:]
+            self.api.answer_callback_query(cq_id, text="正在切换会话...")
+            self._switch_to_session(chat_id, reply_to, int(user_id), session_id)
+            return
+
+        self.api.answer_callback_query(cq_id, text="不支持的操作。", show_alert=True)
 
     @staticmethod
     def _parse_command(text: str) -> Tuple[str, str]:
@@ -416,9 +537,12 @@ class TgCodexService:
                     "可用命令:",
                     "/sessions [N] - 查看最近 N 条会话（标题 + 编号）",
                     "/use <编号|session_id> - 切换当前会话",
+                    "/history [编号|session_id] [N] - 查看会话最近 N 条消息",
                     "/new [cwd] - 进入新会话模式（下一条普通消息会新建 session）",
                     "/status - 查看当前绑定会话",
                     "/ask <内容> - 手动提问（可选）",
+                    "执行 /sessions 后，可直接发送编号切换会话",
+                    "执行 /sessions 后，也可点击按钮直接切换会话",
                     "直接发普通消息即可对话（会自动续聊当前 session）",
                 ]
             ),
@@ -439,40 +563,133 @@ class TgCodexService:
             return
         lines = ["最近会话（用 /use 编号 切换）:"]
         session_ids = [s.session_id for s in items]
+        keyboard_rows: List[List[Dict[str, str]]] = []
         for i, s in enumerate(items, start=1):
             short_id = s.session_id[:8]
             cwd_name = Path(s.cwd).name or s.cwd
             lines.append(f"{i}. {s.title} | {short_id} | {cwd_name}")
-        self.api.send_message(chat_id, "\n".join(lines), reply_to=reply_to)
+            keyboard_rows.append(
+                [
+                    {
+                        "text": f"切换 {i}",
+                        "callback_data": f"use:{s.session_id}",
+                    }
+                ]
+            )
+        lines.append("直接发送编号即可切换（例如发送: 1）")
+        self.api.send_message(
+            chat_id,
+            "\n".join(lines),
+            reply_to=reply_to,
+            reply_markup={"inline_keyboard": keyboard_rows},
+        )
         self.state.set_last_session_ids(user_id, session_ids)
+        self.state.set_pending_session_pick(user_id, True)
 
     def _handle_use(self, chat_id: int, reply_to: int, user_id: int, arg: str) -> None:
-        raw = arg.strip()
-        if not raw:
+        selector = arg.strip()
+        if not selector:
             self.api.send_message(chat_id, "示例: /use 1 或 /use <session_id>", reply_to=reply_to)
             return
-        session_id = raw
-        if raw.isdigit():
-            idx = int(raw)
-            recent_ids = self.state.get_last_session_ids(user_id)
-            if idx <= 0 or idx > len(recent_ids):
-                self.api.send_message(
-                    chat_id,
-                    "编号无效。先执行 /sessions，再用 /use 编号。",
-                    reply_to=reply_to,
-                )
-                return
-            session_id = recent_ids[idx - 1]
+        session_id, err = self._resolve_session_selector(user_id, selector)
+        if err:
+            self.api.send_message(chat_id, err, reply_to=reply_to)
+            return
+        if not session_id:
+            self.api.send_message(chat_id, "无效的会话选择参数。", reply_to=reply_to)
+            return
+        self._switch_to_session(chat_id, reply_to, user_id, session_id)
+
+    def _switch_to_session(self, chat_id: int, reply_to: int, user_id: int, session_id: str) -> None:
         meta = self.sessions.find_by_id(session_id)
         if not meta:
             self.api.send_message(chat_id, f"未找到 session: {session_id}", reply_to=reply_to)
             return
         self.state.set_active_session(user_id, meta.session_id, meta.cwd)
+        self.state.set_pending_session_pick(user_id, False)
         self.api.send_message(
             chat_id,
             f"已切换到:\n{meta.title}\nsession: {meta.session_id}\ncwd: {meta.cwd}\n现在可直接发消息对话。",
             reply_to=reply_to,
         )
+
+    def _try_handle_quick_session_pick(self, chat_id: int, reply_to: int, user_id: int, text: str) -> bool:
+        if not self.state.is_pending_session_pick(user_id):
+            return False
+        raw = text.strip()
+        if not raw.isdigit():
+            return False
+        idx = int(raw)
+        recent_ids = self.state.get_last_session_ids(user_id)
+        if idx <= 0 or idx > len(recent_ids):
+            self.api.send_message(
+                chat_id,
+                "编号无效。请发送 /sessions 重新查看列表。",
+                reply_to=reply_to,
+            )
+            return True
+        self._switch_to_session(chat_id, reply_to, user_id, recent_ids[idx - 1])
+        return True
+
+    def _handle_history(self, chat_id: int, reply_to: int, user_id: int, arg: str) -> None:
+        tokens = [x for x in arg.split() if x]
+        limit = 10
+        session_id: Optional[str] = None
+
+        if not tokens:
+            session_id, _ = self.state.get_active(user_id)
+            if not session_id:
+                self.api.send_message(
+                    chat_id,
+                    "当前无 active session。先 /use 选择会话，或直接对话后再查看历史。",
+                    reply_to=reply_to,
+                )
+                return
+        else:
+            session_id, err = self._resolve_session_selector(user_id, tokens[0])
+            if err:
+                self.api.send_message(chat_id, err, reply_to=reply_to)
+                return
+            if not session_id:
+                self.api.send_message(chat_id, "无效的会话选择参数。", reply_to=reply_to)
+                return
+            if len(tokens) >= 2:
+                try:
+                    limit = int(tokens[1])
+                except ValueError:
+                    self.api.send_message(chat_id, "N 必须是数字，示例: /history 1 20", reply_to=reply_to)
+                    return
+
+        limit = max(1, min(50, limit))
+        meta, messages = self.sessions.get_history(session_id, limit=limit)
+        if not meta:
+            self.api.send_message(chat_id, f"未找到 session: {session_id}", reply_to=reply_to)
+            return
+        if not messages:
+            self.api.send_message(chat_id, "该会话暂无可展示历史消息。", reply_to=reply_to)
+            return
+
+        lines = [
+            f"会话历史: {meta.title}",
+            f"session: {meta.session_id}",
+            f"显示最近 {len(messages)} 条消息:",
+        ]
+        for i, (role, message) in enumerate(messages, start=1):
+            role_zh = "用户" if role == "user" else "助手"
+            lines.append(f"{i}. [{role_zh}] {SessionStore.compact_message(message)}")
+        self.api.send_message(chat_id, "\n".join(lines), reply_to=reply_to)
+
+    def _resolve_session_selector(self, user_id: int, selector: str) -> Tuple[Optional[str], Optional[str]]:
+        raw = selector.strip()
+        if not raw:
+            return None, "示例: /use 1 或 /use <session_id>"
+        if raw.isdigit():
+            idx = int(raw)
+            recent_ids = self.state.get_last_session_ids(user_id)
+            if idx <= 0 or idx > len(recent_ids):
+                return None, "编号无效。先执行 /sessions，再用编号。"
+            return recent_ids[idx - 1], None
+        return raw, None
 
     def _handle_status(self, chat_id: int, reply_to: int, user_id: int) -> None:
         session_id, cwd = self.state.get_active(user_id)
@@ -511,6 +728,7 @@ class TgCodexService:
                 return
             target_cwd = candidate
         self.state.clear_active_session(user_id, str(target_cwd))
+        self.state.set_pending_session_pick(user_id, False)
         self.api.send_message(
             chat_id,
             f"已进入新会话模式，cwd: {target_cwd}\n下一条普通消息会创建一个新 session。",
@@ -527,6 +745,7 @@ class TgCodexService:
             cwd = self.default_cwd
 
         mode = "继续当前会话" if active_id else "新建会话"
+        log(f"run prompt: user_id={user_id} mode={mode} cwd={cwd} session={active_id}")
         self.api.send_message(chat_id, f"正在调用本机 Codex（{mode}），请稍等...", reply_to=reply_to)
         try:
             thread_id, answer, stderr_text, return_code = self.codex.run_prompt(
@@ -602,7 +821,7 @@ def build_service() -> TgCodexService:
 
 def main() -> None:
     service = build_service()
-    print("[info] tg-codex service started")
+    log("tg-codex service started")
     service.run_forever()
 
 
