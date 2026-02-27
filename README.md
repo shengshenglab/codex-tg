@@ -18,7 +18,7 @@ export TELEGRAM_BOT_TOKEN="你的 bot token"
 export ALLOWED_TELEGRAM_USER_IDS="123456789"   # 可选，逗号分隔
 export CODEX_SESSION_ROOT="$HOME/.codex/sessions"  # 可选
 export STATE_PATH="./bot_state.json"                # 可选
-export DEFAULT_CWD="/Users/xysheng/Desktop/codex/codex-tg"  # 可选
+export DEFAULT_CWD="/path/to/your/project/codex-tg" # 可选（示例占位：当前仓库目录）
 ```
 
 说明：
