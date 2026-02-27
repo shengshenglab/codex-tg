@@ -92,8 +92,8 @@ Tips:
 
 ## Known Limitation
 
-- Sessions newly created from Telegram usually do not appear in the Codex desktop session list immediately
-- Continuing an older session that already exists locally will still show up and remain accessible in the Codex client
+- New sessions created from Telegram are mainly visible in terminal/CLI session history
+- Codex Desktop client usually needs a restart before newly continued sessions become visible
 
 ## Notes
 

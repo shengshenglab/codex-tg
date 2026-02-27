@@ -5,6 +5,7 @@ import shutil
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.error
@@ -16,6 +17,16 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 MAX_TELEGRAM_TEXT = 4096
+BOT_COMMANDS: List[Dict[str, str]] = [
+    {"command": "start", "description": "开始使用"},
+    {"command": "help", "description": "查看帮助"},
+    {"command": "sessions", "description": "查看最近会话"},
+    {"command": "use", "description": "切换会话"},
+    {"command": "history", "description": "查看会话历史"},
+    {"command": "new", "description": "新建会话模式"},
+    {"command": "status", "description": "查看当前会话"},
+    {"command": "ask", "description": "在当前会话提问"},
+]
 
 
 def log(msg: str) -> None:
@@ -113,6 +124,15 @@ class TelegramAPI:
             payload["text"] = part
             self._request("sendMessage", payload)
 
+    def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
+        self._request("sendChatAction", {"chat_id": chat_id, "action": action})
+
+    def set_my_commands(self, commands: List[Dict[str, str]]) -> None:
+        self._request("setMyCommands", {"commands": commands})
+
+    def set_chat_menu_button_commands(self) -> None:
+        self._request("setChatMenuButton", {"menu_button": {"type": "commands"}})
+
     def answer_callback_query(
         self,
         callback_query_id: str,
@@ -135,6 +155,34 @@ class SessionMeta:
     cwd: str
     file_path: str
     title: str
+
+
+class TypingStatus:
+    def __init__(self, api: TelegramAPI, chat_id: int, interval_sec: float = 4.0):
+        self.api = api
+        self.chat_id = chat_id
+        self.interval_sec = interval_sec
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self.api.send_chat_action(self.chat_id, "typing")
+            except Exception:
+                pass
+            self._stop_event.wait(self.interval_sec)
 
 
 class SessionStore:
@@ -163,6 +211,35 @@ class SessionStore:
             if meta and meta.session_id == session_id:
                 return meta
         return None
+
+    def mark_as_desktop_session(self, session_id: str) -> bool:
+        meta = self.find_by_id(session_id)
+        if not meta:
+            return False
+        path = Path(meta.file_path)
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+            if not lines:
+                return False
+            first = json.loads(lines[0])
+            if first.get("type") != "session_meta":
+                return False
+            payload = first.get("payload") or {}
+            changed = False
+            if payload.get("source") != "vscode":
+                payload["source"] = "vscode"
+                changed = True
+            if payload.get("originator") != "Codex Desktop":
+                payload["originator"] = "Codex Desktop"
+                changed = True
+            if not changed:
+                return True
+            first["payload"] = payload
+            lines[0] = json.dumps(first, ensure_ascii=False, separators=(",", ":"))
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            return True
+        except Exception:
+            return False
 
     def get_history(
         self,
@@ -430,6 +507,14 @@ class TgCodexService:
                 print(f"[warn] loop error: {e}", file=sys.stderr)
                 traceback.print_exc()
                 time.sleep(2)
+
+    def setup_bot_menu(self) -> None:
+        self.api.set_my_commands(BOT_COMMANDS)
+        try:
+            self.api.set_chat_menu_button_commands()
+        except Exception:
+            # Non-critical; setMyCommands already provides slash-menu commands.
+            pass
 
     def _handle_update(self, update: Dict[str, Any]) -> None:
         callback_query = update.get("callback_query")
@@ -746,7 +831,8 @@ class TgCodexService:
 
         mode = "继续当前会话" if active_id else "新建会话"
         log(f"run prompt: user_id={user_id} mode={mode} cwd={cwd} session={active_id}")
-        self.api.send_message(chat_id, f"正在调用本机 Codex（{mode}），请稍等...", reply_to=reply_to)
+        typing = TypingStatus(self.api, chat_id)
+        typing.start()
         try:
             thread_id, answer, stderr_text, return_code = self.codex.run_prompt(
                 prompt=prompt,
@@ -760,6 +846,8 @@ class TgCodexService:
                 reply_to=reply_to,
             )
             return
+        finally:
+            typing.stop()
 
         if thread_id:
             self.state.set_active_session(user_id, thread_id, str(cwd))
@@ -771,8 +859,7 @@ class TgCodexService:
             self.api.send_message(chat_id, msg, reply_to=reply_to)
             return
 
-        header = f"session: {thread_id or active_id or 'unknown'}\n（可在本地 Codex 客户端继续该会话）\n"
-        self.api.send_message(chat_id, header + answer, reply_to=reply_to)
+        self.api.send_message(chat_id, answer, reply_to=reply_to)
 
 
 def resolve_codex_bin(configured: Optional[str]) -> str:
@@ -821,6 +908,11 @@ def build_service() -> TgCodexService:
 
 def main() -> None:
     service = build_service()
+    try:
+        service.setup_bot_menu()
+        log("bot command menu configured")
+    except Exception as e:
+        log(f"bot command menu setup failed: {e}")
     log("tg-codex service started")
     service.run_forever()
 
