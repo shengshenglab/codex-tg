@@ -1,0 +1,20 @@
+{
+  "users": {
+    "1598156292": {
+      "last_session_ids": [
+        "019c9ca8-fe8b-7471-82f4-035742b58ce3",
+        "019c9cae-4d06-77e3-904f-aa512e061179",
+        "019c5111-af60-7b23-9933-2697b7fa381c",
+        "019c8edf-1420-7030-9627-9dcc213323a4",
+        "019c9448-b2e3-7b90-91c3-175d60db0d69",
+        "019c5a14-dbe3-7d50-802c-cd54ed5558a7",
+        "019c8e8c-0f67-7383-b869-405588c1bbac",
+        "019c8d56-ead4-7ec1-968f-f0ced0ad7248",
+        "019c50fd-a75e-7321-b4fa-c891d97a3169",
+        "019c567d-5062-7d61-9856-d2f406bddfb5"
+      ],
+      "active_session_id": "019c9ca8-fe8b-7471-82f4-035742b58ce3",
+      "active_cwd": "/Users/xysheng/Desktop/codex/codex-tg"
+    }
+  }
+}
