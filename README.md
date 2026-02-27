@@ -1,64 +1,66 @@
 # tg-codex
 
-`tg-codex` 是一个 Telegram 机器人服务，用于在 Telegram 中远程调用本机 `codex` 会话。
+Language: English | [简体中文](README.zh-CN.md)
 
-## 功能
+`tg-codex` is a Telegram bot service that lets you run and continue local `codex` sessions from Telegram.
 
-- 查看本地历史会话（标题化展示）
-- 切换会话并继续追问
-- 支持在 Telegram 中创建新会话或续聊已有会话
-- 支持查看会话最近消息（`/history`）
+## Features
 
-## 环境要求
+- List local session history with titles
+- Switch to an existing session and continue asking
+- Create new sessions from Telegram
+- View recent messages in a session (`/history`)
+
+## Requirements
 
 - Python 3.9+
-- 本机已安装并可执行 `codex`（且已登录）
+- Local `codex` installed and already logged in
 - Telegram Bot Token
 
-## 快速开始
+## Quick Start
 
-### 1) 获取 Telegram Bot Token
+### 1) Get a Telegram Bot Token
 
-1. 在 Telegram 打开 `@BotFather`
-2. 发送 `/newbot` 并按提示创建机器人
-3. 保存返回的 token（用于 `TELEGRAM_BOT_TOKEN`）
+1. Open `@BotFather` in Telegram
+2. Send `/newbot` and follow the prompts
+3. Save the returned token for `TELEGRAM_BOT_TOKEN`
 
-### 2) 获取你的 Telegram User ID
+### 2) Get Your Telegram User ID
 
-方式 A（推荐）：
-1. 在 Telegram 打开 `@userinfobot`
-2. 发送任意消息，读取返回的数字 ID
+Method A (recommended):
+1. Open `@userinfobot`
+2. Send any message and copy your numeric user ID
 
-方式 B（Bot API）：
-1. 先给你的机器人发送 `/start`
-2. 执行：
+Method B (Bot API):
+1. Send `/start` to your bot first
+2. Run:
 
 ```bash
 curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates"
 ```
 
-3. 在返回 JSON 中查找 `message.from.id`
+3. Find `message.from.id` in the JSON response
 
-### 3) 配置环境变量
+### 3) Configure Environment Variables
 
 ```bash
-export TELEGRAM_BOT_TOKEN="你的 bot token"
-export ALLOWED_TELEGRAM_USER_IDS="123456789"          # 建议设置，多个用逗号分隔
-export CODEX_SESSION_ROOT="$HOME/.codex/sessions"     # 可选
-export STATE_PATH="./.runtime/bot_state.json"         # 可选
-export DEFAULT_CWD="/path/to/your/project/codex-tg"   # 可选
-export CODEX_BIN="/Applications/Codex.app/Contents/Resources/codex"  # 可选
+export TELEGRAM_BOT_TOKEN="your bot token"
+export ALLOWED_TELEGRAM_USER_IDS="123456789"         # recommended, comma-separated for multiple users
+export CODEX_SESSION_ROOT="$HOME/.codex/sessions"    # optional
+export STATE_PATH="./.runtime/bot_state.json"        # optional
+export DEFAULT_CWD="/path/to/your/project/codex-tg"  # optional
+export CODEX_BIN="/Applications/Codex.app/Contents/Resources/codex"  # optional
 ```
 
-### 4) 启动服务
+### 4) Start the Service
 
-推荐使用脚本：
+Recommended:
 
 ```bash
 ./run.sh start
 ```
 
-常用命令：
+Common commands:
 
 ```bash
 ./run.sh stop
@@ -67,33 +69,33 @@ export CODEX_BIN="/Applications/Codex.app/Contents/Resources/codex"  # 可选
 ./run.sh restart
 ```
 
-也可直接运行：
+Or run directly:
 
 ```bash
 python3 tg_codex_bot.py
 ```
 
-## Telegram 命令
+## Telegram Commands
 
 - `/help`
-- `/sessions [N]`：查看最近 N 条会话（标题 + 编号）
-- `/use <编号|session_id>`：切换会话
-- `/history [编号|session_id] [N]`：查看会话最近 N 条消息（默认 10，最大 50）
-- `/new [cwd]`：进入新会话模式，下一条普通消息会新建会话
-- `/status`：查看当前绑定会话
-- `/ask <内容>`：在当前会话提问
-- 直接发送普通文本：自动续聊当前会话；若处于新会话模式则创建新会话
+- `/sessions [N]`: list recent `N` sessions (title + index)
+- `/use <index|session_id>`: switch active session
+- `/history [index|session_id] [N]`: show the latest `N` messages (default 10, max 50)
+- `/new [cwd]`: enter new-session mode; next normal message creates a new session
+- `/status`: show current active session
+- `/ask <text>`: ask in the current session
+- Send normal text directly: continue current session, or create one if in new-session mode
 
-提示：
-- 执行 `/sessions` 后，可直接发送编号（如 `1`）切换会话
-- 执行 `/sessions` 后，也可点击返回消息中的“切换”按钮
+Tips:
+- After `/sessions`, you can send an index directly (for example `1`) to switch
+- After `/sessions`, you can also use the inline switch buttons
 
-## 已知限制
+## Known Limitation
 
-- 在 Telegram 侧新创建的会话，通常不会在 Codex 客户端会话列表中直接显示
-- 但如果是历史老会话（已在本地客户端存在），通过 Telegram 继续对话后，仍可在客户端显示并续聊
+- Sessions newly created from Telegram usually do not appear in the Codex desktop session list immediately
+- Continuing an older session that already exists locally will still show up and remain accessible in the Codex client
 
-## 说明
+## Notes
 
-- 当前实现基于 Telegram Bot API 长轮询（无 webhook）
-- 当前为一次请求结束后回包，未实现流式逐条推送
+- Uses Telegram Bot API long polling (no webhook)
+- Replies are returned after each request finishes (no streaming push yet)
