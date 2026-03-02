@@ -37,9 +37,9 @@ export FEISHU_APP_SECRET="xxx"
 export DEFAULT_CWD="/path/to/your/project/codex-tg"
 export CODEX_BIN="/Applications/Codex.app/Contents/Resources/codex"
 export CODEX_SESSION_ROOT="$HOME/.codex/sessions"
-export CODEX_SANDBOX_MODE="danger-full-access"       # 默认已提升权限
-export CODEX_APPROVAL_POLICY="never"                 # 默认不询问审批
-export CODEX_DANGEROUS_BYPASS=0                      # 设为 1 将完全绕过审批和沙箱（极高风险）
+export CODEX_SANDBOX_MODE=""                         # 可选：仅 CODEX_DANGEROUS_BYPASS=1 时生效
+export CODEX_APPROVAL_POLICY=""                      # 可选：仅 CODEX_DANGEROUS_BYPASS=1 时生效
+export CODEX_DANGEROUS_BYPASS=0                      # 0/1/2（见下方权限说明）
 ```
 
 ### 2) 启动服务
@@ -89,13 +89,17 @@ export FEISHU_RICH_MESSAGE=1                      # 默认 1，助手回复使�
 
 ## 权限开关与风险
 
-服务会把以下环境变量透传给 `codex exec`：
+权限行为由 `CODEX_DANGEROUS_BYPASS` 控制：
 
-- `CODEX_SANDBOX_MODE`：默认 `danger-full-access`
-- `CODEX_APPROVAL_POLICY`：默认 `never`
-- `CODEX_DANGEROUS_BYPASS`：默认 `0`
+- `0`（默认）：不额外追加权限参数（最小权限）
+- `1`：启用权限参数  
+  - `CODEX_SANDBOX_MODE` 默认 `danger-full-access`（可覆盖）
+  - `CODEX_APPROVAL_POLICY` 默认 `never`（可覆盖）
+- `2`：追加参数 `--dangerously-bypass-approvals-and-sandbox`
 
-当 `CODEX_DANGEROUS_BYPASS=1` 时，会追加参数 `--dangerously-bypass-approvals-and-sandbox`，这会完全跳过审批与沙箱保护。
+说明：
+- `CODEX_SANDBOX_MODE` / `CODEX_APPROVAL_POLICY` 在 `CODEX_DANGEROUS_BYPASS=1` 时才会使用
+- `CODEX_DANGEROUS_BYPASS=2` 优先走完全绕过模式
 
 风险说明：
 

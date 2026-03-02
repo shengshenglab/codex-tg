@@ -73,6 +73,21 @@ def parse_allowed_user_ids(raw: Optional[str]) -> Optional[Set[int]]:
     return result
 
 
+def parse_dangerous_bypass_level(raw: Optional[str]) -> int:
+    value = (raw or "0").strip()
+    if not value:
+        return 0
+    try:
+        level = int(value)
+    except ValueError:
+        raise ValueError("CODEX_DANGEROUS_BYPASS must be 0, 1, or 2")
+    if level < 0:
+        level = 0
+    if level > 2:
+        level = 2
+    return level
+
+
 class TelegramAPI:
     def __init__(
         self,
@@ -410,12 +425,12 @@ class CodexRunner:
         codex_bin: str,
         sandbox_mode: Optional[str] = None,
         approval_policy: Optional[str] = None,
-        dangerous_bypass: bool = False,
+        dangerous_bypass_level: int = 0,
     ):
         self.codex_bin = codex_bin
         self.sandbox_mode = sandbox_mode
         self.approval_policy = approval_policy
-        self.dangerous_bypass = dangerous_bypass
+        self.dangerous_bypass_level = max(0, min(2, int(dangerous_bypass_level)))
 
     @staticmethod
     def _to_toml_string(value: str) -> str:
@@ -429,13 +444,14 @@ class CodexRunner:
         session_id: Optional[str] = None,
     ) -> Tuple[Optional[str], str, str, int]:
         config_flags: List[str] = []
-        if self.sandbox_mode:
-            config_flags.extend(["-c", f"sandbox_mode={self._to_toml_string(self.sandbox_mode)}"])
-        if self.approval_policy:
-            config_flags.extend(["-c", f"approval_policy={self._to_toml_string(self.approval_policy)}"])
+        if self.dangerous_bypass_level == 1:
+            sandbox_mode = self.sandbox_mode or "danger-full-access"
+            approval_policy = self.approval_policy or "never"
+            config_flags.extend(["-c", f"sandbox_mode={self._to_toml_string(sandbox_mode)}"])
+            config_flags.extend(["-c", f"approval_policy={self._to_toml_string(approval_policy)}"])
 
         exec_flags: List[str] = ["--json", "--skip-git-repo-check"]
-        if self.dangerous_bypass:
+        if self.dangerous_bypass_level >= 2:
             exec_flags.append("--dangerously-bypass-approvals-and-sandbox")
 
         if session_id:
@@ -909,7 +925,7 @@ def build_service() -> TgCodexService:
     codex_bin = resolve_codex_bin(env("CODEX_BIN"))
     codex_sandbox_mode = env("CODEX_SANDBOX_MODE")
     codex_approval_policy = env("CODEX_APPROVAL_POLICY")
-    codex_dangerous_bypass = env("CODEX_DANGEROUS_BYPASS", "0") == "1"
+    codex_dangerous_bypass_level = parse_dangerous_bypass_level(env("CODEX_DANGEROUS_BYPASS", "0"))
     default_cwd = Path(env("DEFAULT_CWD", os.getcwd())).expanduser()
     ca_bundle = env("TELEGRAM_CA_BUNDLE")
     insecure_skip_verify = env("TELEGRAM_INSECURE_SKIP_VERIFY", "0") == "1"
@@ -925,10 +941,12 @@ def build_service() -> TgCodexService:
         codex_bin=codex_bin,
         sandbox_mode=codex_sandbox_mode,
         approval_policy=codex_approval_policy,
-        dangerous_bypass=codex_dangerous_bypass,
+        dangerous_bypass_level=codex_dangerous_bypass_level,
     )
-    if codex_dangerous_bypass:
-        log("[warn] CODEX_DANGEROUS_BYPASS=1, approvals and sandbox are fully bypassed")
+    if codex_dangerous_bypass_level == 1:
+        log("[warn] CODEX_DANGEROUS_BYPASS=1, enabling sandbox_mode=danger-full-access and approval_policy=never")
+    elif codex_dangerous_bypass_level >= 2:
+        log("[warn] CODEX_DANGEROUS_BYPASS=2, approvals and sandbox are fully bypassed")
 
     return TgCodexService(
         api=api,

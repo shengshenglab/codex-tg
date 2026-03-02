@@ -15,7 +15,13 @@ except ImportError as err:  # pragma: no cover
         "Install with: python3 -m pip install --user lark-oapi"
     ) from err
 
-from tg_codex_bot import BotState, CodexRunner, SessionStore, resolve_codex_bin
+from tg_codex_bot import (
+    BotState,
+    CodexRunner,
+    SessionStore,
+    parse_dangerous_bypass_level,
+    resolve_codex_bin,
+)
 
 
 MAX_FEISHU_TEXT = 2000
@@ -73,6 +79,77 @@ def parse_text_content(raw: Optional[str]) -> str:
         return ""
     text = re.sub(r"<at[^>]*>.*?</at>", "", text, flags=re.IGNORECASE | re.DOTALL)
     return text.strip()
+
+
+def _flatten_post_block(node: Any) -> str:
+    if node is None:
+        return ""
+    if isinstance(node, str):
+        return node
+    if isinstance(node, list):
+        # `post.content` is usually a list of lines, each line is a list of blocks.
+        if not node:
+            return ""
+        if all(isinstance(x, list) for x in node):
+            lines: List[str] = []
+            for line in node:
+                line_text = "".join(_flatten_post_block(part) for part in line).strip()
+                if line_text:
+                    lines.append(line_text)
+            return "\n".join(lines)
+        return "".join(_flatten_post_block(x) for x in node)
+    if isinstance(node, dict):
+        tag = str(node.get("tag") or "").lower()
+        if tag == "text":
+            return str(node.get("text") or "")
+        if tag == "a":
+            return str(node.get("text") or node.get("href") or "")
+        if tag == "at":
+            return str(node.get("user_name") or node.get("name") or "")
+        if tag in ("img", "media"):
+            return "[图片]"
+        # Fallback: flatten any nested values.
+        return "".join(_flatten_post_block(v) for v in node.values())
+    return ""
+
+
+def parse_post_content(raw: Optional[str]) -> str:
+    if not raw:
+        return ""
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+
+    locale_payload: Dict[str, Any] = {}
+    if isinstance(parsed.get("zh_cn"), dict):
+        locale_payload = parsed["zh_cn"]
+    elif isinstance(parsed.get("en_us"), dict):
+        locale_payload = parsed["en_us"]
+    else:
+        for value in parsed.values():
+            if isinstance(value, dict):
+                locale_payload = value
+                break
+    if not locale_payload:
+        return ""
+
+    title = str(locale_payload.get("title") or "").strip()
+    content_text = _flatten_post_block(locale_payload.get("content")).strip()
+    if title and content_text:
+        return f"{title}\n{content_text}"
+    return title or content_text
+
+
+def parse_incoming_message_content(message_type: str, raw: Optional[str]) -> str:
+    msg_type = (message_type or "").strip().lower()
+    if msg_type == "text":
+        return parse_text_content(raw)
+    if msg_type == "post":
+        return parse_post_content(raw)
+    return ""
 
 
 def adapt_markdown_for_feishu(markdown: str) -> Tuple[str, str]:
@@ -312,7 +389,9 @@ class FeishuCodexService:
         if not event or not event.message:
             return
         msg = event.message
-        if msg.message_type != "text":
+        msg_type = (msg.message_type or "").strip().lower()
+        if msg_type not in ("text", "post"):
+            log(f"unsupported message type ignored: message_type={msg_type or 'unknown'}")
             return
         message_id = (msg.message_id or "").strip()
         if message_id:
@@ -345,8 +424,9 @@ class FeishuCodexService:
             self.api.send_message(chat_id, "没有权限使用这个 bot。")
             return
 
-        text = parse_text_content(msg.content)
+        text = parse_incoming_message_content(msg_type, msg.content)
         if not text:
+            log(f"empty content ignored: message_type={msg_type} message_id={message_id}")
             return
 
         if chat_type == "p2p" and not self.enable_p2p:
@@ -623,7 +703,7 @@ def build_service() -> FeishuCodexService:
     codex_bin = resolve_codex_bin(env("CODEX_BIN"))
     codex_sandbox_mode = env("CODEX_SANDBOX_MODE")
     codex_approval_policy = env("CODEX_APPROVAL_POLICY")
-    codex_dangerous_bypass = env("CODEX_DANGEROUS_BYPASS", "0") == "1"
+    codex_dangerous_bypass_level = parse_dangerous_bypass_level(env("CODEX_DANGEROUS_BYPASS", "0"))
     default_cwd = Path(env("DEFAULT_CWD", os.getcwd())).expanduser()
     enable_p2p = env("FEISHU_ENABLE_P2P", "0") == "1"
     log_level = env("FEISHU_LOG_LEVEL", "INFO") or "INFO"
@@ -641,10 +721,12 @@ def build_service() -> FeishuCodexService:
         codex_bin=codex_bin,
         sandbox_mode=codex_sandbox_mode,
         approval_policy=codex_approval_policy,
-        dangerous_bypass=codex_dangerous_bypass,
+        dangerous_bypass_level=codex_dangerous_bypass_level,
     )
-    if codex_dangerous_bypass:
-        log("[warn] CODEX_DANGEROUS_BYPASS=1, approvals and sandbox are fully bypassed")
+    if codex_dangerous_bypass_level == 1:
+        log("[warn] CODEX_DANGEROUS_BYPASS=1, enabling sandbox_mode=danger-full-access and approval_policy=never")
+    elif codex_dangerous_bypass_level >= 2:
+        log("[warn] CODEX_DANGEROUS_BYPASS=2, approvals and sandbox are fully bypassed")
 
     return FeishuCodexService(
         api=api,

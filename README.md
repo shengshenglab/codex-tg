@@ -37,9 +37,9 @@ export FEISHU_APP_SECRET="xxx"
 export DEFAULT_CWD="/path/to/your/project/codex-tg"
 export CODEX_BIN="/Applications/Codex.app/Contents/Resources/codex"
 export CODEX_SESSION_ROOT="$HOME/.codex/sessions"
-export CODEX_SANDBOX_MODE="danger-full-access"       # elevated by default
-export CODEX_APPROVAL_POLICY="never"                 # no approval prompts by default
-export CODEX_DANGEROUS_BYPASS=0                      # set 1 to bypass both approval and sandbox (VERY HIGH RISK)
+export CODEX_SANDBOX_MODE=""                         # optional: used only when CODEX_DANGEROUS_BYPASS=1
+export CODEX_APPROVAL_POLICY=""                      # optional: used only when CODEX_DANGEROUS_BYPASS=1
+export CODEX_DANGEROUS_BYPASS=0                      # 0/1/2 (see permission section below)
 ```
 
 ### 2) Start services
@@ -89,13 +89,17 @@ Notes:
 
 ## Permission Switches & Risks
 
-The service passes these env vars to `codex exec`:
+Permission behavior is controlled by `CODEX_DANGEROUS_BYPASS`:
 
-- `CODEX_SANDBOX_MODE` (default: `danger-full-access`)
-- `CODEX_APPROVAL_POLICY` (default: `never`)
-- `CODEX_DANGEROUS_BYPASS` (default: `0`)
+- `0` (default): no extra permission flags (least privilege)
+- `1`: enable permission flags
+  - `CODEX_SANDBOX_MODE` defaults to `danger-full-access` (override allowed)
+  - `CODEX_APPROVAL_POLICY` defaults to `never` (override allowed)
+- `2`: append `--dangerously-bypass-approvals-and-sandbox`
 
-When `CODEX_DANGEROUS_BYPASS=1`, it adds `--dangerously-bypass-approvals-and-sandbox`, which disables both approval and sandbox protections.
+Notes:
+- `CODEX_SANDBOX_MODE` / `CODEX_APPROVAL_POLICY` are applied only when `CODEX_DANGEROUS_BYPASS=1`
+- `CODEX_DANGEROUS_BYPASS=2` takes full bypass path
 
 Risk notes:
 

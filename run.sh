@@ -19,8 +19,8 @@ FEISHU_LOG_FILE="$RUNTIME_DIR/feishu_bot.log"
 DEFAULT_CWD="${DEFAULT_CWD:-$SCRIPT_DIR}"
 CODEX_BIN="${CODEX_BIN:-/Applications/Codex.app/Contents/Resources/codex}"
 CODEX_SESSION_ROOT="${CODEX_SESSION_ROOT:-$HOME/.codex/sessions}"
-CODEX_SANDBOX_MODE="${CODEX_SANDBOX_MODE:-danger-full-access}"
-CODEX_APPROVAL_POLICY="${CODEX_APPROVAL_POLICY:-never}"
+CODEX_SANDBOX_MODE="${CODEX_SANDBOX_MODE:-}"
+CODEX_APPROVAL_POLICY="${CODEX_APPROVAL_POLICY:-}"
 CODEX_DANGEROUS_BYPASS="${CODEX_DANGEROUS_BYPASS:-0}"
 
 # Telegram env
@@ -237,9 +237,12 @@ export ALLOWED_TELEGRAM_USER_IDS="123456789"   # 可选，推荐
 export FEISHU_APP_ID="cli_xxx"
 export FEISHU_APP_SECRET="xxx"
 
-# Codex command execution policy (high risk defaults)
-export CODEX_SANDBOX_MODE="danger-full-access"
-export CODEX_APPROVAL_POLICY="never"
+# Codex command execution policy
+# 0: no extra permission args (default)
+# 1: defaults to sandbox_mode=danger-full-access + approval_policy=never
+# 2: append --dangerously-bypass-approvals-and-sandbox
+export CODEX_SANDBOX_MODE=""   # optional override for level=1
+export CODEX_APPROVAL_POLICY="" # optional override for level=1
 export CODEX_DANGEROUS_BYPASS=0
 EOF
 }

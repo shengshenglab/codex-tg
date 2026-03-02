@@ -19,8 +19,8 @@ FEISHU_RICH_MESSAGE="${FEISHU_RICH_MESSAGE:-1}"
 DEFAULT_CWD="${DEFAULT_CWD:-$SCRIPT_DIR}"
 CODEX_BIN="${CODEX_BIN:-/Applications/Codex.app/Contents/Resources/codex}"
 CODEX_SESSION_ROOT="${CODEX_SESSION_ROOT:-$HOME/.codex/sessions}"
-CODEX_SANDBOX_MODE="${CODEX_SANDBOX_MODE:-danger-full-access}"
-CODEX_APPROVAL_POLICY="${CODEX_APPROVAL_POLICY:-never}"
+CODEX_SANDBOX_MODE="${CODEX_SANDBOX_MODE:-}"
+CODEX_APPROVAL_POLICY="${CODEX_APPROVAL_POLICY:-}"
 CODEX_DANGEROUS_BYPASS="${CODEX_DANGEROUS_BYPASS:-0}"
 # ======================================================
 
@@ -155,9 +155,12 @@ export FEISHU_ENABLE_P2P=1
 export FEISHU_LOG_LEVEL=INFO
 export FEISHU_RICH_MESSAGE=1
 
-# Codex command execution policy (high risk defaults)
-export CODEX_SANDBOX_MODE="danger-full-access"
-export CODEX_APPROVAL_POLICY="never"
+# Codex command execution policy
+# 0: no extra permission args (default)
+# 1: defaults to sandbox_mode=danger-full-access + approval_policy=never
+# 2: append --dangerously-bypass-approvals-and-sandbox
+export CODEX_SANDBOX_MODE=""    # optional override for level=1
+export CODEX_APPROVAL_POLICY="" # optional override for level=1
 export CODEX_DANGEROUS_BYPASS=0
 EOF
 }
