@@ -123,21 +123,48 @@ def parse_post_content(raw: Optional[str]) -> str:
     if not isinstance(parsed, dict):
         return ""
 
+    # Different clients may send `post` payloads in different wrappers,
+    # for example:
+    # 1) {"zh_cn": {...}}
+    # 2) {"post": {"zh_cn": {...}}}
+    # 3) {"title": "...", "content": [...]}
     locale_payload: Dict[str, Any] = {}
-    if isinstance(parsed.get("zh_cn"), dict):
-        locale_payload = parsed["zh_cn"]
-    elif isinstance(parsed.get("en_us"), dict):
-        locale_payload = parsed["en_us"]
-    else:
-        for value in parsed.values():
-            if isinstance(value, dict):
-                locale_payload = value
-                break
+    candidate_roots: List[Dict[str, Any]] = [parsed]
+    nested_post = parsed.get("post")
+    if isinstance(nested_post, dict):
+        candidate_roots.append(nested_post)
+    nested_data = parsed.get("data")
+    if isinstance(nested_data, dict):
+        candidate_roots.append(nested_data)
+
+    for root in candidate_roots:
+        if isinstance(root.get("zh_cn"), dict):
+            locale_payload = root["zh_cn"]
+            break
+        if isinstance(root.get("en_us"), dict):
+            locale_payload = root["en_us"]
+            break
+        if "content" in root or "title" in root:
+            locale_payload = root
+            break
+
     if not locale_payload:
         return ""
 
     title = str(locale_payload.get("title") or "").strip()
-    content_text = _flatten_post_block(locale_payload.get("content")).strip()
+    content_node = locale_payload.get("content")
+    if isinstance(content_node, str):
+        # Some payloads encode `content` as a JSON string.
+        try:
+            content_node = json.loads(content_node)
+        except json.JSONDecodeError:
+            pass
+
+    content_text = _flatten_post_block(content_node).strip()
+    if not content_text:
+        # Fallback for unexpected structures.
+        content_text = _flatten_post_block(locale_payload).strip()
+
     if title and content_text:
         return f"{title}\n{content_text}"
     return title or content_text
