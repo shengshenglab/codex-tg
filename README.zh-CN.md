@@ -37,6 +37,9 @@ export FEISHU_APP_SECRET="xxx"
 export DEFAULT_CWD="/path/to/your/project/codex-tg"
 export CODEX_BIN="/Applications/Codex.app/Contents/Resources/codex"
 export CODEX_SESSION_ROOT="$HOME/.codex/sessions"
+export CODEX_SANDBOX_MODE="danger-full-access"       # 默认已提升权限
+export CODEX_APPROVAL_POLICY="never"                 # 默认不询问审批
+export CODEX_DANGEROUS_BYPASS=0                      # 设为 1 将完全绕过审批和沙箱（极高风险）
 ```
 
 ### 2) 启动服务
@@ -74,7 +77,7 @@ export CODEX_SESSION_ROOT="$HOME/.codex/sessions"
 
 ```bash
 export ALLOWED_FEISHU_OPEN_IDS="ou_xxx,ou_yyy"  # 可选，飞书用户白名单（open_id）
-export FEISHU_ENABLE_P2P=0                        # 默认 0，仅群聊；设为 1 可启用私聊
+export FEISHU_ENABLE_P2P=1                        # 默认 1，启用私聊；设为 0 仅群聊
 export FEISHU_LOG_LEVEL="INFO"                  # DEBUG/INFO/WARN/ERROR
 export FEISHU_RICH_MESSAGE=1                      # 默认 1，助手回复使用富文本卡片
 ```
@@ -83,6 +86,22 @@ export FEISHU_RICH_MESSAGE=1                      # 默认 1，助手回复使�
 
 - `FEISHU_RICH_MESSAGE=1` 时，回复使用飞书卡片 Markdown（标题、列表、代码块）
 - 若需仅管理飞书渠道，可用：`./run_feishu.sh start|stop|status|logs|restart`
+
+## 权限开关与风险
+
+服务会把以下环境变量透传给 `codex exec`：
+
+- `CODEX_SANDBOX_MODE`：默认 `danger-full-access`
+- `CODEX_APPROVAL_POLICY`：默认 `never`
+- `CODEX_DANGEROUS_BYPASS`：默认 `0`
+
+当 `CODEX_DANGEROUS_BYPASS=1` 时，会追加参数 `--dangerously-bypass-approvals-and-sandbox`，这会完全跳过审批与沙箱保护。
+
+风险说明：
+
+- 可能执行任意命令并修改/删除本机文件
+- 可能读取并外发敏感数据（如密钥、配置、源码）
+- 建议仅在受控环境中临时开启，使用后立即恢复为 `0`
 
 ## 命令列表（Telegram / 飞书）
 

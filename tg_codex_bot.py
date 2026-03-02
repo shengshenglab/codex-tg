@@ -405,8 +405,22 @@ class BotState:
 
 
 class CodexRunner:
-    def __init__(self, codex_bin: str):
+    def __init__(
+        self,
+        codex_bin: str,
+        sandbox_mode: Optional[str] = None,
+        approval_policy: Optional[str] = None,
+        dangerous_bypass: bool = False,
+    ):
         self.codex_bin = codex_bin
+        self.sandbox_mode = sandbox_mode
+        self.approval_policy = approval_policy
+        self.dangerous_bypass = dangerous_bypass
+
+    @staticmethod
+    def _to_toml_string(value: str) -> str:
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
 
     def run_prompt(
         self,
@@ -414,23 +428,33 @@ class CodexRunner:
         cwd: Path,
         session_id: Optional[str] = None,
     ) -> Tuple[Optional[str], str, str, int]:
+        config_flags: List[str] = []
+        if self.sandbox_mode:
+            config_flags.extend(["-c", f"sandbox_mode={self._to_toml_string(self.sandbox_mode)}"])
+        if self.approval_policy:
+            config_flags.extend(["-c", f"approval_policy={self._to_toml_string(self.approval_policy)}"])
+
+        exec_flags: List[str] = ["--json", "--skip-git-repo-check"]
+        if self.dangerous_bypass:
+            exec_flags.append("--dangerously-bypass-approvals-and-sandbox")
+
         if session_id:
             cmd = [
                 self.codex_bin,
                 "exec",
                 "resume",
+                *config_flags,
+                *exec_flags,
                 session_id,
                 prompt,
-                "--json",
-                "--skip-git-repo-check",
             ]
         else:
             cmd = [
                 self.codex_bin,
                 "exec",
+                *config_flags,
+                *exec_flags,
                 prompt,
-                "--json",
-                "--skip-git-repo-check",
             ]
 
         try:
@@ -883,6 +907,9 @@ def build_service() -> TgCodexService:
     session_root = Path(env("CODEX_SESSION_ROOT", "~/.codex/sessions")).expanduser()
     state_path = Path(env("STATE_PATH", "./bot_state.json"))
     codex_bin = resolve_codex_bin(env("CODEX_BIN"))
+    codex_sandbox_mode = env("CODEX_SANDBOX_MODE")
+    codex_approval_policy = env("CODEX_APPROVAL_POLICY")
+    codex_dangerous_bypass = env("CODEX_DANGEROUS_BYPASS", "0") == "1"
     default_cwd = Path(env("DEFAULT_CWD", os.getcwd())).expanduser()
     ca_bundle = env("TELEGRAM_CA_BUNDLE")
     insecure_skip_verify = env("TELEGRAM_INSECURE_SKIP_VERIFY", "0") == "1"
@@ -894,7 +921,14 @@ def build_service() -> TgCodexService:
     )
     sessions = SessionStore(session_root)
     state = BotState(state_path)
-    codex = CodexRunner(codex_bin)
+    codex = CodexRunner(
+        codex_bin=codex_bin,
+        sandbox_mode=codex_sandbox_mode,
+        approval_policy=codex_approval_policy,
+        dangerous_bypass=codex_dangerous_bypass,
+    )
+    if codex_dangerous_bypass:
+        log("[warn] CODEX_DANGEROUS_BYPASS=1, approvals and sandbox are fully bypassed")
 
     return TgCodexService(
         api=api,

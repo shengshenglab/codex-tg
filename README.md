@@ -37,6 +37,9 @@ export FEISHU_APP_SECRET="xxx"
 export DEFAULT_CWD="/path/to/your/project/codex-tg"
 export CODEX_BIN="/Applications/Codex.app/Contents/Resources/codex"
 export CODEX_SESSION_ROOT="$HOME/.codex/sessions"
+export CODEX_SANDBOX_MODE="danger-full-access"       # elevated by default
+export CODEX_APPROVAL_POLICY="never"                 # no approval prompts by default
+export CODEX_DANGEROUS_BYPASS=0                      # set 1 to bypass both approval and sandbox (VERY HIGH RISK)
 ```
 
 ### 2) Start services
@@ -74,7 +77,7 @@ Feishu uses official SDK long connection mode (no public callback URL required).
 
 ```bash
 export ALLOWED_FEISHU_OPEN_IDS="ou_xxx,ou_yyy"   # optional open_id allowlist
-export FEISHU_ENABLE_P2P=0                         # default 0 (group only), set 1 to enable DM
+export FEISHU_ENABLE_P2P=1                         # default 1 (DM enabled), set 0 for group-only
 export FEISHU_LOG_LEVEL="INFO"                  # DEBUG/INFO/WARN/ERROR
 export FEISHU_RICH_MESSAGE=1                       # default 1, render replies as rich cards
 ```
@@ -83,6 +86,22 @@ Notes:
 
 - With `FEISHU_RICH_MESSAGE=1`, replies are sent as card markdown (titles/lists/code blocks)
 - To manage Feishu only, use `./run_feishu.sh start|stop|status|logs|restart`
+
+## Permission Switches & Risks
+
+The service passes these env vars to `codex exec`:
+
+- `CODEX_SANDBOX_MODE` (default: `danger-full-access`)
+- `CODEX_APPROVAL_POLICY` (default: `never`)
+- `CODEX_DANGEROUS_BYPASS` (default: `0`)
+
+When `CODEX_DANGEROUS_BYPASS=1`, it adds `--dangerously-bypass-approvals-and-sandbox`, which disables both approval and sandbox protections.
+
+Risk notes:
+
+- It may execute arbitrary commands and modify/delete local files
+- It may read and exfiltrate sensitive data (keys, configs, source code)
+- Enable only in controlled environments and switch back to `0` afterward
 
 ## Commands (Telegram / Feishu)
 

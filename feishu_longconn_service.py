@@ -78,7 +78,7 @@ def parse_text_content(raw: Optional[str]) -> str:
 def adapt_markdown_for_feishu(markdown: str) -> Tuple[str, str]:
     """Convert common markdown syntax to formats better supported by lark_md."""
     if not markdown:
-        return "Codex 回复", markdown
+        return "", markdown
 
     # Some model outputs wrap the whole content in ```markdown ... ```.
     # Unwrap it first so headings/lists can be rendered as markdown instead of code.
@@ -89,16 +89,18 @@ def adapt_markdown_for_feishu(markdown: str) -> Tuple[str, str]:
 
     lines = markdown.splitlines()
     in_code_block = False
-    title = "Codex 回复"
+    title = ""
     title_found = False
     out: List[str] = []
 
     for raw in lines:
         line = raw.rstrip("\n")
         striped = line.strip()
-        if striped.startswith("```"):
+        fence = re.match(r"^```[A-Za-z0-9_+-]*\s*$", striped)
+        if fence:
+            # lark_md is more stable with plain ``` fences than language-tag fences.
             in_code_block = not in_code_block
-            out.append(line)
+            out.append("```")
             continue
         if in_code_block:
             out.append(line)
@@ -146,7 +148,7 @@ class FeishuAPI:
             ok = ok and sent
         return ok
 
-    def send_agent_message(self, chat_id: str, text: str, title: str = "Codex 回复") -> bool:
+    def send_agent_message(self, chat_id: str, text: str, title: str = "") -> bool:
         if not self.rich_message_enabled:
             return self.send_message(chat_id, text)
         adapted_title, adapted_text = adapt_markdown_for_feishu(text)
@@ -155,7 +157,9 @@ class FeishuAPI:
         total = len(parts)
         ok = True
         for i, part in enumerate(parts, start=1):
-            chunk_title = final_title if total == 1 else f"{final_title} ({i}/{total})"
+            chunk_title = final_title if total == 1 else (
+                f"{final_title} ({i}/{total})" if final_title else ""
+            )
             sent = self._send_interactive_markdown(
                 receive_id_type="chat_id",
                 receive_id=chat_id,
@@ -204,10 +208,6 @@ class FeishuAPI:
     ) -> bool:
         card = {
             "config": {"wide_screen_mode": True},
-            "header": {
-                "template": "blue",
-                "title": {"tag": "plain_text", "content": title},
-            },
             "elements": [
                 {
                     "tag": "div",
@@ -215,6 +215,11 @@ class FeishuAPI:
                 }
             ],
         }
+        if title:
+            card["header"] = {
+                "template": "blue",
+                "title": {"tag": "plain_text", "content": title},
+            }
         request = (
             lark.im.v1.CreateMessageRequest.builder()
             .receive_id_type(receive_id_type)
@@ -260,12 +265,14 @@ class FeishuCodexService:
         self.allowed_open_ids = allowed_open_ids
         self.enable_p2p = enable_p2p
         self.seen_event_ids: Set[str] = set()
+        self.seen_message_ids: Set[str] = set()
         self.event_handler = (
             lark.EventDispatcherHandler.builder("", "", api.level)
             .register_p2_im_message_receive_v1(self._on_message_receive)
             .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(self._on_ignored_event)
             .register_p2_im_chat_member_bot_added_v1(self._on_ignored_event)
             .register_p2_im_chat_member_bot_deleted_v1(self._on_ignored_event)
+            .register_p2_customized_event("im.message.message_read_v1", self._on_custom_ignored_event)
             .build()
         )
         self.ws_client = lark.ws.Client(
@@ -285,6 +292,12 @@ class FeishuCodexService:
         event_id = getattr(header, "event_id", "")
         log(f"event ignored: {event_type} id={event_id}")
 
+    def _on_custom_ignored_event(self, data: Any) -> None:
+        header = getattr(data, "header", None)
+        event_type = getattr(header, "event_type", "unknown")
+        event_id = getattr(header, "event_id", "")
+        log(f"event ignored(custom): {event_type} id={event_id}")
+
     def _on_message_receive(self, data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         header = data.header
         event_id = getattr(header, "event_id", "")
@@ -301,6 +314,14 @@ class FeishuCodexService:
         msg = event.message
         if msg.message_type != "text":
             return
+        message_id = (msg.message_id or "").strip()
+        if message_id:
+            if message_id in self.seen_message_ids:
+                log(f"duplicate message dropped: message_id={message_id}")
+                return
+            self.seen_message_ids.add(message_id)
+            if len(self.seen_message_ids) > 10000:
+                self.seen_message_ids.clear()
 
         sender = event.sender
         if sender and sender.sender_type == "app":
@@ -600,6 +621,9 @@ def build_service() -> FeishuCodexService:
     session_root = Path(env("CODEX_SESSION_ROOT", "~/.codex/sessions")).expanduser()
     state_path = Path(env("STATE_PATH", "./feishu_bot_state.json"))
     codex_bin = resolve_codex_bin(env("CODEX_BIN"))
+    codex_sandbox_mode = env("CODEX_SANDBOX_MODE")
+    codex_approval_policy = env("CODEX_APPROVAL_POLICY")
+    codex_dangerous_bypass = env("CODEX_DANGEROUS_BYPASS", "0") == "1"
     default_cwd = Path(env("DEFAULT_CWD", os.getcwd())).expanduser()
     enable_p2p = env("FEISHU_ENABLE_P2P", "0") == "1"
     log_level = env("FEISHU_LOG_LEVEL", "INFO") or "INFO"
@@ -613,7 +637,14 @@ def build_service() -> FeishuCodexService:
     )
     sessions = SessionStore(session_root)
     state = BotState(state_path)
-    codex = CodexRunner(codex_bin)
+    codex = CodexRunner(
+        codex_bin=codex_bin,
+        sandbox_mode=codex_sandbox_mode,
+        approval_policy=codex_approval_policy,
+        dangerous_bypass=codex_dangerous_bypass,
+    )
+    if codex_dangerous_bypass:
+        log("[warn] CODEX_DANGEROUS_BYPASS=1, approvals and sandbox are fully bypassed")
 
     return FeishuCodexService(
         api=api,
