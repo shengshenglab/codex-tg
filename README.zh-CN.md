@@ -28,6 +28,10 @@
 # Telegram（可选）
 export TELEGRAM_BOT_TOKEN="你的 bot token"
 export ALLOWED_TELEGRAM_USER_IDS="123456789"          # 可选，建议设置，多个用逗号分隔
+export TG_STREAM_ENABLED=1                             # 可选，默认 1，启用流式编辑回复
+export TG_STREAM_EDIT_INTERVAL_MS=300                 # 可选，流式编辑节流间隔（毫秒）
+export TG_STREAM_MIN_DELTA_CHARS=8                    # 可选，最小增量字符数，小于该值可能跳过刷新
+export TG_THINKING_STATUS_INTERVAL_MS=700             # 可选，思考状态刷新间隔（毫秒）
 
 # 飞书（可选）
 export FEISHU_APP_ID="cli_xxx"

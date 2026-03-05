@@ -13,7 +13,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 
 MAX_TELEGRAM_TEXT = 4096
@@ -88,6 +88,16 @@ def parse_dangerous_bypass_level(raw: Optional[str]) -> int:
     return level
 
 
+def parse_non_negative_int(raw: Optional[str], default: int) -> int:
+    if raw is None:
+        return default
+    try:
+        value = int(raw.strip())
+    except (ValueError, TypeError, AttributeError):
+        return default
+    return value if value >= 0 else default
+
+
 class TelegramAPI:
     def __init__(
         self,
@@ -130,14 +140,40 @@ class TelegramAPI:
         reply_to: Optional[int] = None,
         reply_markup: Optional[Dict[str, Any]] = None,
     ) -> None:
+        for part in chunk_text(text, size=min(3800, MAX_TELEGRAM_TEXT)):
+            self.send_message_with_result(
+                chat_id=chat_id,
+                text=part,
+                reply_to=reply_to,
+                reply_markup=reply_markup,
+            )
+
+    def send_message_with_result(
+        self,
+        chat_id: int,
+        text: str,
+        reply_to: Optional[int] = None,
+        reply_markup: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"chat_id": chat_id, "text": text}
         if reply_to is not None:
             payload["reply_to_message_id"] = reply_to
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
-        for part in chunk_text(text, size=min(3800, MAX_TELEGRAM_TEXT)):
-            payload["text"] = part
-            self._request("sendMessage", payload)
+        return self._request("sendMessage", payload)
+
+    def edit_message_text(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+        }
+        self._request("editMessageText", payload)
 
     def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
         self._request("sendChatAction", {"chat_id": chat_id, "action": action})
@@ -442,6 +478,7 @@ class CodexRunner:
         prompt: str,
         cwd: Path,
         session_id: Optional[str] = None,
+        on_update: Optional[Callable[[str], None]] = None,
     ) -> Tuple[Optional[str], str, str, int]:
         config_flags: List[str] = []
         if self.dangerous_bypass_level == 1:
@@ -474,28 +511,93 @@ class CodexRunner:
             ]
 
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
                 cwd=str(cwd),
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                check=False,
+                bufsize=1,
             )
         except FileNotFoundError as e:
             return None, f"找不到 codex 可执行文件: {self.codex_bin}", str(e), 127
-        thread_id, agent_text = self._parse_exec_json(proc.stdout)
+
+        stdout_lines: List[str] = []
+        stderr_chunks: List[str] = []
+
+        def _collect_stderr() -> None:
+            if proc.stderr is None:
+                return
+            for line in proc.stderr:
+                stderr_chunks.append(line)
+
+        stderr_thread: Optional[threading.Thread] = None
+        if proc.stderr is not None:
+            stderr_thread = threading.Thread(target=_collect_stderr, daemon=True)
+            stderr_thread.start()
+
+        thread_id: Optional[str] = None
+        messages: List[str] = []
+        current_agent_text = ""
+        last_emitted = ""
+
+        if proc.stdout is not None:
+            for raw_line in proc.stdout:
+                stdout_lines.append(raw_line.rstrip("\n"))
+                line = raw_line.strip()
+                if not line or not line.startswith("{"):
+                    continue
+                try:
+                    evt = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                evt_thread_id, messages, current_agent_text, changed = self._consume_exec_event(
+                    evt,
+                    messages,
+                    current_agent_text,
+                )
+                if evt_thread_id and not thread_id:
+                    thread_id = evt_thread_id
+                if on_update and changed:
+                    live_text = self._compose_agent_text(messages, current_agent_text)
+                    if live_text and live_text != last_emitted:
+                        try:
+                            on_update(live_text)
+                        except Exception:
+                            pass
+                        last_emitted = live_text
+
+        return_code = proc.wait()
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=2.0)
+        stderr_text = "".join(stderr_chunks).strip()
+
+        if current_agent_text.strip():
+            final_piece = current_agent_text.strip()
+            if not messages or messages[-1] != final_piece:
+                messages.append(final_piece)
+
+        agent_text = self._compose_agent_text(messages, "")
+        stdout_text = "\n".join(stdout_lines)
+        if not thread_id or not agent_text:
+            parsed_thread_id, parsed_text = self._parse_exec_json(stdout_text)
+            if not thread_id:
+                thread_id = parsed_thread_id
+            if not agent_text:
+                agent_text = parsed_text
         if not agent_text:
-            merged = (proc.stdout + "\n" + proc.stderr).strip()
+            merged = (stdout_text + "\n" + stderr_text).strip()
             if merged:
                 agent_text = merged[-3500:]
             else:
                 agent_text = "Codex 没有返回可展示内容。"
-        return thread_id, agent_text, proc.stderr.strip(), proc.returncode
+        return thread_id, agent_text, stderr_text, return_code
 
     @staticmethod
     def _parse_exec_json(stdout: str) -> Tuple[Optional[str], str]:
         thread_id: Optional[str] = None
         messages: List[str] = []
+        current_agent_text = ""
         for line in stdout.splitlines():
             line = line.strip()
             if not line or not line.startswith("{"):
@@ -504,15 +606,110 @@ class CodexRunner:
                 evt = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if evt.get("type") == "thread.started":
-                thread_id = evt.get("thread_id")
-            if evt.get("type") == "item.completed":
-                item = evt.get("item") or {}
-                if item.get("type") == "agent_message":
-                    text = item.get("text")
-                    if text:
-                        messages.append(text)
-        return thread_id, "\n\n".join(messages).strip()
+            evt_thread_id, messages, current_agent_text, _ = CodexRunner._consume_exec_event(
+                evt,
+                messages,
+                current_agent_text,
+            )
+            if evt_thread_id and not thread_id:
+                thread_id = evt_thread_id
+        text = CodexRunner._compose_agent_text(messages, current_agent_text)
+        return thread_id, text
+
+    @staticmethod
+    def _compose_agent_text(messages: List[str], current_agent_text: str) -> str:
+        parts = [m.strip() for m in messages if isinstance(m, str) and m.strip()]
+        if current_agent_text.strip():
+            parts.append(current_agent_text.strip())
+        return "\n\n".join(parts).strip()
+
+    @staticmethod
+    def _consume_exec_event(
+        evt: Dict[str, Any],
+        messages: List[str],
+        current_agent_text: str,
+    ) -> Tuple[Optional[str], List[str], str, bool]:
+        thread_id: Optional[str] = None
+        changed = False
+        event_type = str(evt.get("type") or "").strip().lower()
+
+        if event_type == "thread.started":
+            thread_id = str(evt.get("thread_id") or "").strip() or None
+            if not thread_id:
+                thread = evt.get("thread")
+                if isinstance(thread, dict):
+                    thread_id = str(thread.get("id") or "").strip() or None
+
+        item = evt.get("item") if isinstance(evt.get("item"), dict) else {}
+        item_type = str(item.get("type") or "").strip().lower()
+        is_agent_item = item_type in ("agent_message", "assistant_message")
+
+        if event_type in ("item.delta", "response.output_text.delta", "assistant_message.delta", "message.delta"):
+            delta = (
+                CodexRunner._extract_text_fragment(evt.get("delta"))
+                or CodexRunner._extract_text_fragment(evt.get("text_delta"))
+                or CodexRunner._extract_text_fragment(evt.get("text"))
+                or CodexRunner._extract_text_fragment(item.get("delta"))
+                or CodexRunner._extract_text_fragment(item.get("text_delta"))
+            )
+            if delta:
+                if not current_agent_text:
+                    current_agent_text = delta
+                elif delta.startswith(current_agent_text):
+                    current_agent_text = delta
+                elif not current_agent_text.endswith(delta):
+                    current_agent_text += delta
+                changed = True
+
+        if event_type in ("item.updated", "item.completed") and is_agent_item:
+            full_text = (
+                CodexRunner._extract_text_fragment(item.get("text"))
+                or CodexRunner._extract_text_fragment(item.get("content"))
+                or CodexRunner._extract_text_fragment(item.get("message"))
+            ).strip()
+            if full_text:
+                current_agent_text = full_text
+                changed = True
+            if event_type == "item.completed" and current_agent_text.strip():
+                finalized = current_agent_text.strip()
+                if not messages or messages[-1] != finalized:
+                    messages.append(finalized)
+                    changed = True
+                current_agent_text = ""
+
+        if event_type in ("turn.completed", "response.completed", "thread.completed"):
+            fallback_text = (
+                CodexRunner._extract_text_fragment(evt.get("output_text"))
+                or CodexRunner._extract_text_fragment(evt.get("text"))
+            ).strip()
+            if fallback_text and (not messages or messages[-1] != fallback_text):
+                messages.append(fallback_text)
+                changed = True
+            if current_agent_text.strip():
+                finalized = current_agent_text.strip()
+                if not messages or messages[-1] != finalized:
+                    messages.append(finalized)
+                    changed = True
+                current_agent_text = ""
+
+        return thread_id, messages, current_agent_text, changed
+
+    @staticmethod
+    def _extract_text_fragment(node: Any) -> str:
+        if node is None:
+            return ""
+        if isinstance(node, str):
+            return node
+        if isinstance(node, list):
+            return "".join(CodexRunner._extract_text_fragment(x) for x in node)
+        if isinstance(node, dict):
+            for key in ("text", "delta", "text_delta", "content", "message", "output_text"):
+                if key in node:
+                    value = CodexRunner._extract_text_fragment(node.get(key))
+                    if value:
+                        return value
+            return "".join(CodexRunner._extract_text_fragment(v) for v in node.values())
+        return ""
 
 
 class TgCodexService:
@@ -524,6 +721,10 @@ class TgCodexService:
         codex: CodexRunner,
         default_cwd: Path,
         allowed_user_ids: Optional[Set[int]],
+        stream_enabled: bool,
+        stream_edit_interval_ms: int,
+        stream_min_delta_chars: int,
+        thinking_status_interval_ms: int,
     ):
         self.api = api
         self.sessions = sessions
@@ -531,6 +732,10 @@ class TgCodexService:
         self.codex = codex
         self.default_cwd = default_cwd
         self.allowed_user_ids = allowed_user_ids
+        self.stream_enabled = stream_enabled
+        self.stream_edit_interval_ms = max(200, stream_edit_interval_ms)
+        self.stream_min_delta_chars = max(1, stream_min_delta_chars)
+        self.thinking_status_interval_ms = max(400, thinking_status_interval_ms)
         self.offset: Optional[int] = None
 
     def run_forever(self) -> None:
@@ -863,6 +1068,66 @@ class TgCodexService:
     def _handle_chat_message(self, chat_id: int, reply_to: int, user_id: int, text: str) -> None:
         self._run_prompt(chat_id, reply_to, user_id, text)
 
+    @staticmethod
+    def _stream_preview_text(text: str) -> str:
+        raw = text.strip() or "..."
+        suffix = "\n\n[生成中...]"
+        max_size = min(3800, MAX_TELEGRAM_TEXT)
+        if len(raw) + len(suffix) <= max_size:
+            return raw + suffix
+        keep = max_size - len(suffix) - 1
+        if keep <= 0:
+            return raw[:max_size]
+        return raw[:keep] + "…" + suffix
+
+    def _finalize_stream_reply(
+        self,
+        chat_id: int,
+        reply_to: int,
+        stream_message_id: Optional[int],
+        text: str,
+        progressive_replay: bool = False,
+    ) -> None:
+        parts = chunk_text(text or "Codex 没有返回可展示内容。", size=min(3800, MAX_TELEGRAM_TEXT))
+        if not parts:
+            parts = ["Codex 没有返回可展示内容。"]
+
+        first_sent = False
+        if stream_message_id is not None:
+            try:
+                self.api.edit_message_text(chat_id, stream_message_id, parts[0])
+                first_sent = True
+            except Exception as e:
+                log(f"stream final edit failed: {e}")
+
+        if not first_sent:
+            self.api.send_message(chat_id, parts[0], reply_to=reply_to)
+            stream_message_id = None
+
+        if progressive_replay and stream_message_id is not None and len(parts) == 1 and len(parts[0]) > 240:
+            full = parts[0]
+            step = 120
+            interval_sec = 0.12
+            for end in range(step, len(full), step):
+                partial = full[:end].rstrip()
+                if not partial:
+                    continue
+                preview = f"{partial}\n\n[生成中...]"
+                try:
+                    self.api.edit_message_text(chat_id, stream_message_id, preview)
+                except Exception:
+                    stream_message_id = None
+                    break
+                time.sleep(interval_sec)
+            if stream_message_id is not None:
+                try:
+                    self.api.edit_message_text(chat_id, stream_message_id, full)
+                except Exception:
+                    stream_message_id = None
+
+        for part in parts[1:]:
+            self.api.send_message(chat_id, part)
+
     def _run_prompt(self, chat_id: int, reply_to: int, user_id: int, prompt: str) -> None:
         active_id, active_cwd = self.state.get_active(user_id)
         cwd = Path(active_cwd).expanduser() if active_cwd else self.default_cwd
@@ -871,6 +1136,80 @@ class TgCodexService:
 
         mode = "继续当前会话" if active_id else "新建会话"
         log(f"run prompt: user_id={user_id} mode={mode} cwd={cwd} session={active_id}")
+        stream_message_id: Optional[int] = None
+        stream_lock = threading.Lock()
+        thinking_stop = threading.Event()
+        first_output = threading.Event()
+        thinking_thread: Optional[threading.Thread] = None
+        stream_state: Dict[str, Any] = {
+            "last_preview": "",
+            "last_emit_at_ms": 0,
+            "content_updates": 0,
+        }
+
+        def edit_stream_message(text: str) -> bool:
+            nonlocal stream_message_id
+            if stream_message_id is None:
+                return False
+            with stream_lock:
+                current_id = stream_message_id
+                if current_id is None:
+                    return False
+                try:
+                    self.api.edit_message_text(chat_id, current_id, text)
+                    return True
+                except Exception as e:
+                    log(f"stream edit failed: {e}")
+                    stream_message_id = None
+                    return False
+
+        if self.stream_enabled:
+            try:
+                sent = self.api.send_message_with_result(chat_id, "思考中...", reply_to=reply_to)
+                msg_id = sent.get("message_id")
+                if isinstance(msg_id, int):
+                    stream_message_id = msg_id
+            except Exception as e:
+                log(f"stream placeholder send failed: {e}")
+
+        def thinking_loop() -> None:
+            phases = ["思考中", "思考中.", "思考中..", "思考中..."]
+            start_ts = time.time()
+            i = 0
+            while not thinking_stop.wait(self.thinking_status_interval_ms / 1000.0):
+                if first_output.is_set():
+                    return
+                elapsed = int(time.time() - start_ts)
+                status_text = f"{phases[i % len(phases)]}\n\n已等待 {elapsed}s"
+                i += 1
+                if not edit_stream_message(status_text):
+                    return
+
+        if stream_message_id is not None:
+            thinking_thread = threading.Thread(target=thinking_loop, daemon=True)
+            thinking_thread.start()
+
+        def on_update(live_text: str) -> None:
+            first_output.set()
+            if stream_message_id is None:
+                return
+            preview = self._stream_preview_text(live_text)
+            now_ms = int(time.time() * 1000)
+            last_preview = str(stream_state.get("last_preview") or "")
+            last_emit_at_ms = int(stream_state.get("last_emit_at_ms") or 0)
+            if preview == last_preview:
+                return
+            # Throttle edit frequency to avoid Telegram 429.
+            delta_chars = abs(len(preview) - len(last_preview))
+            if now_ms - last_emit_at_ms < self.stream_edit_interval_ms and delta_chars < self.stream_min_delta_chars:
+                return
+            ok = edit_stream_message(preview)
+            if not ok:
+                return
+            stream_state["last_preview"] = preview
+            stream_state["last_emit_at_ms"] = now_ms
+            stream_state["content_updates"] = int(stream_state.get("content_updates") or 0) + 1
+
         typing = TypingStatus(self.api, chat_id)
         typing.start()
         try:
@@ -878,15 +1217,22 @@ class TgCodexService:
                 prompt=prompt,
                 cwd=cwd,
                 session_id=active_id,
+                on_update=on_update if stream_message_id is not None else None,
             )
         except Exception as e:
-            self.api.send_message(
-                chat_id,
-                f"调用 Codex 时出现异常: {e}",
-                reply_to=reply_to,
-            )
+            thinking_stop.set()
+            if thinking_thread is not None:
+                thinking_thread.join(timeout=0.3)
+            err_msg = f"调用 Codex 时出现异常: {e}"
+            if stream_message_id is not None:
+                self._finalize_stream_reply(chat_id, reply_to, stream_message_id, err_msg, progressive_replay=False)
+            else:
+                self.api.send_message(chat_id, err_msg, reply_to=reply_to)
             return
         finally:
+            thinking_stop.set()
+            if thinking_thread is not None:
+                thinking_thread.join(timeout=0.3)
             typing.stop()
 
         if thread_id:
@@ -896,7 +1242,15 @@ class TgCodexService:
             msg = f"Codex 执行失败 (exit={return_code})\n{answer}"
             if stderr_text:
                 msg += f"\n\nstderr:\n{stderr_text[-1200:]}"
-            self.api.send_message(chat_id, msg, reply_to=reply_to)
+            if stream_message_id is not None:
+                self._finalize_stream_reply(chat_id, reply_to, stream_message_id, msg, progressive_replay=False)
+            else:
+                self.api.send_message(chat_id, msg, reply_to=reply_to)
+            return
+
+        if stream_message_id is not None:
+            replay = int(stream_state.get("content_updates") or 0) == 0
+            self._finalize_stream_reply(chat_id, reply_to, stream_message_id, answer, progressive_replay=replay)
             return
 
         self.api.send_message(chat_id, answer, reply_to=reply_to)
@@ -929,6 +1283,10 @@ def build_service() -> TgCodexService:
     default_cwd = Path(env("DEFAULT_CWD", os.getcwd())).expanduser()
     ca_bundle = env("TELEGRAM_CA_BUNDLE")
     insecure_skip_verify = env("TELEGRAM_INSECURE_SKIP_VERIFY", "0") == "1"
+    tg_stream_enabled = env("TG_STREAM_ENABLED", "1") == "1"
+    tg_stream_edit_interval_ms = parse_non_negative_int(env("TG_STREAM_EDIT_INTERVAL_MS", "300"), 300)
+    tg_stream_min_delta_chars = parse_non_negative_int(env("TG_STREAM_MIN_DELTA_CHARS", "8"), 8)
+    tg_thinking_status_interval_ms = parse_non_negative_int(env("TG_THINKING_STATUS_INTERVAL_MS", "700"), 700)
 
     api = TelegramAPI(
         token=token,
@@ -947,6 +1305,15 @@ def build_service() -> TgCodexService:
         log("[warn] CODEX_DANGEROUS_BYPASS=1, enabling sandbox_mode=danger-full-access and approval_policy=never")
     elif codex_dangerous_bypass_level >= 2:
         log("[warn] CODEX_DANGEROUS_BYPASS=2, approvals and sandbox are fully bypassed")
+    if tg_stream_enabled:
+        log(
+            "[info] TG streaming enabled "
+            f"(edit interval: {tg_stream_edit_interval_ms}ms, "
+            f"min delta: {tg_stream_min_delta_chars}, "
+            f"thinking interval: {tg_thinking_status_interval_ms}ms)"
+        )
+    else:
+        log("[info] TG streaming disabled")
 
     return TgCodexService(
         api=api,
@@ -955,6 +1322,10 @@ def build_service() -> TgCodexService:
         codex=codex,
         default_cwd=default_cwd,
         allowed_user_ids=allowed_user_ids,
+        stream_enabled=tg_stream_enabled,
+        stream_edit_interval_ms=tg_stream_edit_interval_ms,
+        stream_min_delta_chars=tg_stream_min_delta_chars,
+        thinking_status_interval_ms=tg_thinking_status_interval_ms,
     )
 
 

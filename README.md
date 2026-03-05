@@ -28,6 +28,10 @@ Language: English | [简体中文](README.zh-CN.md)
 # Telegram (optional)
 export TELEGRAM_BOT_TOKEN="your bot token"
 export ALLOWED_TELEGRAM_USER_IDS="123456789"         # optional, recommended
+export TG_STREAM_ENABLED=1                            # optional, default 1 (streaming reply edits)
+export TG_STREAM_EDIT_INTERVAL_MS=300                # optional, stream edit throttle interval in ms
+export TG_STREAM_MIN_DELTA_CHARS=8                    # optional, skip refresh if change is too small
+export TG_THINKING_STATUS_INTERVAL_MS=700             # optional, thinking status refresh interval in ms
 
 # Feishu (optional)
 export FEISHU_APP_ID="cli_xxx"

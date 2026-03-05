@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -304,6 +305,32 @@ class FeishuAPI:
             ok = ok and sent
         return ok
 
+    def send_agent_message_with_id(self, chat_id: str, text: str, title: str = "") -> Optional[str]:
+        """Send one interactive markdown message and return created message_id."""
+        if not self.rich_message_enabled:
+            return None
+        adapted_title, adapted_text = adapt_markdown_for_feishu(text)
+        final_title = adapted_title or title
+        first = chunk_text(adapted_text, size=3200)[0]
+        return self._create_interactive_markdown(
+            receive_id_type="chat_id",
+            receive_id=chat_id,
+            title=final_title,
+            markdown=first,
+        )
+
+    def patch_agent_message(self, message_id: str, text: str, title: str = "") -> bool:
+        if not self.rich_message_enabled:
+            return False
+        adapted_title, adapted_text = adapt_markdown_for_feishu(text)
+        final_title = adapted_title or title
+        first = chunk_text(adapted_text, size=3200)[0]
+        return self._patch_interactive_markdown(
+            message_id=message_id,
+            title=final_title,
+            markdown=first,
+        )
+
     def send_message_to_open_id(self, open_id: str, text: str) -> bool:
         ok = True
         for part in chunk_text(text, size=min(1800, MAX_FEISHU_TEXT)):
@@ -341,6 +368,16 @@ class FeishuAPI:
         title: str,
         markdown: str,
     ) -> bool:
+        created_id = self._create_interactive_markdown(
+            receive_id_type=receive_id_type,
+            receive_id=receive_id,
+            title=title,
+            markdown=markdown,
+        )
+        return created_id is not None
+
+    @staticmethod
+    def _build_interactive_card_content(title: str, markdown: str) -> str:
         card = {
             "config": {"wide_screen_mode": True},
             "elements": [
@@ -355,6 +392,16 @@ class FeishuAPI:
                 "template": "blue",
                 "title": {"tag": "plain_text", "content": title},
             }
+        return json.dumps(card, ensure_ascii=False)
+
+    def _create_interactive_markdown(
+        self,
+        receive_id_type: str,
+        receive_id: str,
+        title: str,
+        markdown: str,
+    ) -> Optional[str]:
+        content = self._build_interactive_card_content(title, markdown)
         request = (
             lark.im.v1.CreateMessageRequest.builder()
             .receive_id_type(receive_id_type)
@@ -362,19 +409,52 @@ class FeishuAPI:
                 lark.im.v1.CreateMessageRequestBody.builder()
                 .receive_id(receive_id)
                 .msg_type("interactive")
-                .content(json.dumps(card, ensure_ascii=False))
+                .content(content)
                 .build()
             )
             .build()
         )
         response = self.client.im.v1.message.create(request)
         if response.success():
-            return True
+            data = getattr(response, "data", None)
+            message_id = ""
+            if data is not None:
+                message_id = str(getattr(data, "message_id", "") or "").strip()
+            return message_id
         log(
             "send failed: "
             f"code={response.code} msg={response.msg} "
             f"log_id={response.get_log_id()} receive_id_type={receive_id_type} "
             "msg_type=interactive"
+        )
+        return None
+
+    def _patch_interactive_markdown(
+        self,
+        message_id: str,
+        title: str,
+        markdown: str,
+    ) -> bool:
+        if not message_id:
+            return False
+        content = self._build_interactive_card_content(title, markdown)
+        request = (
+            lark.im.v1.PatchMessageRequest.builder()
+            .message_id(message_id)
+            .request_body(
+                lark.im.v1.PatchMessageRequestBody.builder()
+                .content(content)
+                .build()
+            )
+            .build()
+        )
+        response = self.client.im.v1.message.patch(request)
+        if response.success():
+            return True
+        log(
+            "patch failed: "
+            f"code={response.code} msg={response.msg} "
+            f"log_id={response.get_log_id()} message_id={message_id}"
         )
         return False
 
@@ -392,6 +472,10 @@ class FeishuCodexService:
         allowed_open_ids: Optional[Set[str]],
         enable_p2p: bool,
         ignore_old_message_seconds: int,
+        stream_enabled: bool,
+        stream_edit_interval_ms: int,
+        stream_min_delta_chars: int,
+        thinking_status_interval_ms: int,
     ):
         self.api = api
         self.sessions = sessions
@@ -401,6 +485,10 @@ class FeishuCodexService:
         self.allowed_open_ids = allowed_open_ids
         self.enable_p2p = enable_p2p
         self.ignore_old_message_seconds = max(0, ignore_old_message_seconds)
+        self.stream_enabled = stream_enabled
+        self.stream_edit_interval_ms = max(250, stream_edit_interval_ms)
+        self.stream_min_delta_chars = max(1, stream_min_delta_chars)
+        self.thinking_status_interval_ms = max(500, thinking_status_interval_ms)
         self.startup_time_ms = int(time.time() * 1000)
         self.seen_event_ids: Set[str] = set()
         self.seen_message_ids: Set[str] = set()
@@ -423,7 +511,11 @@ class FeishuCodexService:
     def run_forever(self) -> None:
         log(
             "feishu long connection service started "
-            f"(ignore_old_message_seconds={self.ignore_old_message_seconds})"
+            f"(ignore_old_message_seconds={self.ignore_old_message_seconds}, "
+            f"stream_enabled={self.stream_enabled}, "
+            f"stream_edit_interval_ms={self.stream_edit_interval_ms}, "
+            f"stream_min_delta_chars={self.stream_min_delta_chars}, "
+            f"thinking_status_interval_ms={self.thinking_status_interval_ms})"
         )
         self.ws_client.start()
 
@@ -737,6 +829,62 @@ class FeishuCodexService:
             f"已进入新会话模式，cwd: {target_cwd}\n下一条普通消息会创建一个新 session。",
         )
 
+    @staticmethod
+    def _stream_preview_text(text: str) -> str:
+        raw = text.strip() or "..."
+        suffix = "\n\n[生成中...]"
+        max_size = 3000
+        if len(raw) + len(suffix) <= max_size:
+            return raw + suffix
+        keep = max_size - len(suffix) - 1
+        if keep <= 0:
+            return raw[:max_size]
+        return raw[:keep] + "…" + suffix
+
+    def _finalize_stream_reply(
+        self,
+        chat_id: str,
+        stream_message_id: Optional[str],
+        text: str,
+        progressive_replay: bool = False,
+    ) -> None:
+        if not stream_message_id:
+            self.api.send_agent_message(chat_id, text)
+            return
+
+        adapted_title, adapted_text = adapt_markdown_for_feishu(text)
+        parts = chunk_text(adapted_text or text or "Codex 没有返回可展示内容。", size=3200)
+        if not parts:
+            parts = ["Codex 没有返回可展示内容。"]
+        total = len(parts)
+
+        first_title = adapted_title if total == 1 else (f"{adapted_title} (1/{total})" if adapted_title else "")
+        first_part = parts[0]
+        patched = self.api.patch_agent_message(stream_message_id, first_part, title=first_title)
+        if not patched:
+            self.api.send_agent_message(chat_id, text)
+            return
+
+        # Fallback when upstream doesn't emit incremental deltas:
+        # replay the final text progressively to avoid one-shot large render.
+        if progressive_replay and total == 1 and len(first_part) > 240:
+            step = 140
+            interval_sec = 0.16
+            for end in range(step, len(first_part), step):
+                partial = first_part[:end].rstrip()
+                if not partial:
+                    continue
+                preview = f"{partial}\n\n[生成中...]"
+                ok = self.api.patch_agent_message(stream_message_id, preview, title=first_title)
+                if not ok:
+                    break
+                time.sleep(interval_sec)
+            self.api.patch_agent_message(stream_message_id, first_part, title=first_title)
+
+        for i, part in enumerate(parts[1:], start=2):
+            chunk_title = adapted_title if total == 1 else (f"{adapted_title} ({i}/{total})" if adapted_title else "")
+            self.api.send_agent_message(chat_id, part, title=chunk_title)
+
     def _run_prompt(self, chat_id: str, actor_id: str, prompt: str) -> None:
         active_id, active_cwd = self.state.get_active(actor_id)  # type: ignore[arg-type]
         cwd = Path(active_cwd).expanduser() if active_cwd else self.default_cwd
@@ -745,15 +893,97 @@ class FeishuCodexService:
 
         mode = "继续当前会话" if active_id else "新建会话"
         log(f"run prompt: actor={actor_id} mode={mode} cwd={cwd} session={active_id}")
+        stream_message_id: Optional[str] = None
+        stream_state: Dict[str, Any] = {
+            "last_preview": "",
+            "last_emit_at_ms": 0,
+            "content_updates": 0,
+        }
+        use_stream = self.stream_enabled and self.api.rich_message_enabled
+        stream_lock = threading.Lock()
+        thinking_stop = threading.Event()
+        first_output = threading.Event()
+        thinking_thread: Optional[threading.Thread] = None
+
+        def patch_stream_message(text: str) -> bool:
+            nonlocal stream_message_id
+            if not stream_message_id:
+                return False
+            with stream_lock:
+                current_id = stream_message_id
+                if not current_id:
+                    return False
+                ok = self.api.patch_agent_message(current_id, text)
+                if not ok:
+                    stream_message_id = None
+                    return False
+            return True
+
+        if use_stream:
+            placeholder_id = self.api.send_agent_message_with_id(chat_id, "思考中...")
+            if placeholder_id:
+                stream_message_id = placeholder_id
+            else:
+                use_stream = False
+
+        def thinking_loop() -> None:
+            phases = ["思考中", "思考中.", "思考中..", "思考中..."]
+            start_ts = time.time()
+            i = 0
+            while not thinking_stop.wait(self.thinking_status_interval_ms / 1000.0):
+                if first_output.is_set():
+                    return
+                elapsed = int(time.time() - start_ts)
+                status_text = f"{phases[i % len(phases)]}\n\n已等待 {elapsed}s"
+                i += 1
+                if not patch_stream_message(status_text):
+                    return
+
+        if use_stream and stream_message_id:
+            thinking_thread = threading.Thread(target=thinking_loop, daemon=True)
+            thinking_thread.start()
+
+        def on_update(live_text: str) -> None:
+            first_output.set()
+            if not use_stream or not stream_message_id:
+                return
+            preview = self._stream_preview_text(live_text)
+            now_ms = int(time.time() * 1000)
+            last_preview = str(stream_state.get("last_preview") or "")
+            last_emit_at_ms = int(stream_state.get("last_emit_at_ms") or 0)
+            if preview == last_preview:
+                return
+            delta_chars = abs(len(preview) - len(last_preview))
+            if now_ms - last_emit_at_ms < self.stream_edit_interval_ms and delta_chars < self.stream_min_delta_chars:
+                return
+            ok = patch_stream_message(preview)
+            if not ok:
+                return
+            stream_state["last_preview"] = preview
+            stream_state["last_emit_at_ms"] = now_ms
+            stream_state["content_updates"] = int(stream_state.get("content_updates") or 0) + 1
+
         try:
             thread_id, answer, stderr_text, return_code = self.codex.run_prompt(
                 prompt=prompt,
                 cwd=cwd,
                 session_id=active_id,
+                on_update=on_update if use_stream else None,
             )
         except Exception as e:
-            self.api.send_message(chat_id, f"调用 Codex 时出现异常: {e}")
+            thinking_stop.set()
+            if thinking_thread is not None:
+                thinking_thread.join(timeout=0.3)
+            err_msg = f"调用 Codex 时出现异常: {e}"
+            if use_stream and stream_message_id:
+                self._finalize_stream_reply(chat_id, stream_message_id, err_msg, progressive_replay=False)
+            else:
+                self.api.send_message(chat_id, err_msg)
             return
+        finally:
+            thinking_stop.set()
+            if thinking_thread is not None:
+                thinking_thread.join(timeout=0.3)
 
         if thread_id:
             self.state.set_active_session(actor_id, thread_id, str(cwd))  # type: ignore[arg-type]
@@ -762,7 +992,15 @@ class FeishuCodexService:
             msg = f"Codex 执行失败 (exit={return_code})\n{answer}"
             if stderr_text:
                 msg += f"\n\nstderr:\n{stderr_text[-1200:]}"
-            self.api.send_message(chat_id, msg)
+            if use_stream and stream_message_id:
+                self._finalize_stream_reply(chat_id, stream_message_id, msg, progressive_replay=False)
+            else:
+                self.api.send_message(chat_id, msg)
+            return
+
+        if use_stream and stream_message_id:
+            replay = int(stream_state.get("content_updates") or 0) == 0
+            self._finalize_stream_reply(chat_id, stream_message_id, answer, progressive_replay=replay)
             return
 
         self.api.send_agent_message(chat_id, answer)
@@ -785,6 +1023,19 @@ def build_service() -> FeishuCodexService:
     enable_p2p = env("FEISHU_ENABLE_P2P", "0") == "1"
     log_level = env("FEISHU_LOG_LEVEL", "INFO") or "INFO"
     rich_message_enabled = env("FEISHU_RICH_MESSAGE", "1") == "1"
+    stream_enabled = env("FEISHU_STREAM_ENABLED", "1") == "1"
+    stream_edit_interval_ms = parse_non_negative_int(
+        env("FEISHU_STREAM_EDIT_INTERVAL_MS", "400"),
+        400,
+    )
+    stream_min_delta_chars = parse_non_negative_int(
+        env("FEISHU_STREAM_MIN_DELTA_CHARS", "12"),
+        12,
+    )
+    thinking_status_interval_ms = parse_non_negative_int(
+        env("FEISHU_THINKING_STATUS_INTERVAL_MS", "900"),
+        900,
+    )
     ignore_old_message_seconds = parse_non_negative_int(
         env("FEISHU_IGNORE_OLD_MESSAGE_SECONDS", "180"),
         180,
@@ -820,6 +1071,10 @@ def build_service() -> FeishuCodexService:
         allowed_open_ids=allowed_open_ids,
         enable_p2p=enable_p2p,
         ignore_old_message_seconds=ignore_old_message_seconds,
+        stream_enabled=stream_enabled,
+        stream_edit_interval_ms=stream_edit_interval_ms,
+        stream_min_delta_chars=stream_min_delta_chars,
+        thinking_status_interval_ms=thinking_status_interval_ms,
     )
 
 
