@@ -186,6 +186,11 @@ start() {
   validate_feishu_config
   validate_shared_config
 
+  if [[ "${CODEX_DANGEROUS_BYPASS}" == "0" ]]; then
+    echo "[info] 当前 CODEX_DANGEROUS_BYPASS=0（不追加权限参数）"
+    echo "[info] 如需更完整权限体验，可设置：export CODEX_DANGEROUS_BYPASS=1"
+  fi
+
   if ! has_tg_config && ! has_feishu_config; then
     echo "[error] 未检测到可启动渠道。"
     echo "请至少配置一组："
