@@ -11,6 +11,7 @@ Language: English | [简体中文](README.zh-CN.md)
 - Keep receiving commands while a session is running, and switch to another thread
 - Create new sessions and control working directory
 - View recent messages in a session (`/history`)
+- Optionally transcribe Telegram voice/audio messages into text before continuing the session
 - Run Telegram only, Feishu only, or both at the same time
 
 ## Requirements
@@ -33,6 +34,21 @@ export TG_STREAM_ENABLED=1                            # optional, default 1 (str
 export TG_STREAM_EDIT_INTERVAL_MS=300                # optional, stream edit throttle interval in ms
 export TG_STREAM_MIN_DELTA_CHARS=8                    # optional, skip refresh if change is too small
 export TG_THINKING_STATUS_INTERVAL_MS=700             # optional, thinking status refresh interval in ms
+export TG_VOICE_TRANSCRIBE_ENABLED=1                  # optional; if unset, run.sh auto-enables when local env is ready
+export TG_VOICE_TRANSCRIBE_BACKEND="local-whisper"    # optional, default local-whisper
+export TG_VOICE_MAX_BYTES=26214400                    # optional, max Telegram audio bytes to transcribe
+
+# Local Whisper backend (no external API)
+export TG_VOICE_LOCAL_MODEL="base"                    # optional
+export TG_VOICE_LOCAL_DEVICE="cpu"                    # optional: cpu | cuda | mps
+export TG_VOICE_LOCAL_LANGUAGE="zh"                   # optional
+export TG_VOICE_FFMPEG_BIN="/opt/homebrew/bin/ffmpeg" # optional, auto-detected if omitted
+
+# OpenAI backend (optional fallback)
+export OPENAI_API_KEY="sk-..."                        # required only when backend=openai
+export OPENAI_BASE_URL="https://api.openai.com/v1"    # optional
+export TG_VOICE_TRANSCRIBE_MODEL="gpt-4o-mini-transcribe"  # optional for backend=openai
+export TG_VOICE_TRANSCRIBE_TIMEOUT_SEC=180            # optional
 
 # Feishu (optional)
 export FEISHU_APP_ID="cli_xxx"
@@ -122,6 +138,19 @@ Risk notes:
 - `/new [cwd]`: enter new-session mode; next normal message creates a new session
 - `/status`: show current active session
 - `/ask <text>`: ask in the current session
+
+## Telegram Voice Messages
+
+Telegram voice and audio messages can be transcribed and then sent into the current Codex session as text.
+
+Notes:
+
+- `local-whisper` does not call an external API; it uses local `whisper` plus `ffmpeg`
+- `run.sh` now probes the local environment on startup: if local Whisper is ready, it auto-enables Telegram voice transcription by default
+- If local dependencies are missing, `run.sh` prints install commands and leaves voice transcription disabled by default
+- This is currently Telegram-only; Feishu still handles text messages only
+- Captions on Telegram audio messages are appended as extra context before the transcript
+- If transcription is not configured, the bot will reply with a clear hint instead of silently ignoring the message
 - Send normal text directly: continue current session, or create one if in new-session mode
 
 Tips:

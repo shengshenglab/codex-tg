@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 import json
+import mimetypes
 import os
 import signal
 import shutil
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
@@ -106,7 +109,9 @@ class TelegramAPI:
         ca_bundle: Optional[str] = None,
         insecure_skip_verify: bool = False,
     ):
+        self.token = token
         self.base_url = f"https://api.telegram.org/bot{token}"
+        self.file_base_url = f"https://api.telegram.org/file/bot{token}"
         self.ssl_context: Optional[ssl.SSLContext] = None
         if insecure_skip_verify:
             self.ssl_context = ssl._create_unverified_context()
@@ -198,6 +203,295 @@ class TelegramAPI:
         if text:
             payload["text"] = text
         self._request("answerCallbackQuery", payload)
+
+    def get_file(self, file_id: str) -> Dict[str, Any]:
+        return self._request("getFile", {"file_id": file_id})
+
+    def download_file_bytes(self, file_path: str) -> bytes:
+        quoted_path = urllib.parse.quote(file_path.lstrip("/"), safe="/")
+        req = urllib.request.Request(url=f"{self.file_base_url}/{quoted_path}", method="GET")
+        with urllib.request.urlopen(req, timeout=120, context=self.ssl_context) as resp:
+            return resp.read()
+
+
+def normalize_audio_filename(file_name: Optional[str], mime_type: Optional[str]) -> Tuple[str, str]:
+    name = (file_name or "").strip() or "telegram-voice.ogg"
+    suffix = Path(name).suffix.lower()
+    if suffix == ".oga":
+        name = f"{Path(name).stem}.ogg"
+        suffix = ".ogg"
+    if not suffix:
+        guessed_suffix = mimetypes.guess_extension(mime_type or "") or ".ogg"
+        if guessed_suffix == ".oga":
+            guessed_suffix = ".ogg"
+        name = f"{name}{guessed_suffix}"
+    content_type = mime_type or mimetypes.guess_type(name)[0] or "application/octet-stream"
+    if content_type == "audio/x-wav":
+        content_type = "audio/wav"
+    return name, content_type
+
+
+def fetch_telegram_audio(
+    api: TelegramAPI,
+    *,
+    file_id: str,
+    file_name: Optional[str],
+    mime_type: Optional[str],
+    file_size: Optional[int],
+    max_bytes: int,
+) -> Tuple[bytes, str, str]:
+    if file_size and file_size > max_bytes:
+        raise RuntimeError(f"语音文件过大（{file_size} bytes），超过当前限制 {max_bytes} bytes。")
+
+    file_meta = api.get_file(file_id)
+    file_path = str(file_meta.get("file_path") or "").strip()
+    if not file_path:
+        raise RuntimeError("Telegram 未返回可下载的 file_path。")
+
+    audio_bytes = api.download_file_bytes(file_path)
+    if not audio_bytes:
+        raise RuntimeError("下载到的语音文件为空。")
+    if len(audio_bytes) > max_bytes:
+        raise RuntimeError(f"语音文件过大（{len(audio_bytes)} bytes），超过当前限制 {max_bytes} bytes。")
+
+    normalized_name, content_type = normalize_audio_filename(
+        file_name or Path(file_path).name,
+        mime_type,
+    )
+    return audio_bytes, normalized_name, content_type
+
+
+class AudioTranscriber:
+    def transcribe_telegram_audio(
+        self,
+        api: TelegramAPI,
+        *,
+        file_id: str,
+        file_name: Optional[str],
+        mime_type: Optional[str],
+        file_size: Optional[int],
+    ) -> str:
+        raise NotImplementedError
+
+
+class OpenAIAudioTranscriber(AudioTranscriber):
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        api_base: str = "https://api.openai.com/v1",
+        timeout_sec: int = 180,
+        max_bytes: int = 25 * 1024 * 1024,
+    ):
+        self.api_key = api_key
+        self.model = model
+        self.api_base = api_base.rstrip("/")
+        self.timeout_sec = max(30, int(timeout_sec))
+        self.max_bytes = max(1, int(max_bytes))
+
+    @staticmethod
+    def _build_multipart_body(
+        *,
+        fields: Dict[str, str],
+        file_field: str,
+        filename: str,
+        content: bytes,
+        content_type: str,
+    ) -> Tuple[bytes, str]:
+        boundary = f"----CodexTgBoundary{uuid.uuid4().hex}"
+        body = bytearray()
+        for key, value in fields.items():
+            body.extend(f"--{boundary}\r\n".encode("utf-8"))
+            body.extend(
+                f'Content-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode("utf-8")
+            )
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(
+            (
+                f'Content-Disposition: form-data; name="{file_field}"; filename="{filename}"\r\n'
+                f"Content-Type: {content_type}\r\n\r\n"
+            ).encode("utf-8")
+        )
+        body.extend(content)
+        body.extend(b"\r\n")
+        body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+        return bytes(body), boundary
+
+    def transcribe_telegram_audio(
+        self,
+        api: TelegramAPI,
+        *,
+        file_id: str,
+        file_name: Optional[str],
+        mime_type: Optional[str],
+        file_size: Optional[int],
+    ) -> str:
+        audio_bytes, normalized_name, content_type = fetch_telegram_audio(
+            api,
+            file_id=file_id,
+            file_name=file_name,
+            mime_type=mime_type,
+            file_size=file_size,
+            max_bytes=self.max_bytes,
+        )
+        body, boundary = self._build_multipart_body(
+            fields={"model": self.model},
+            file_field="file",
+            filename=normalized_name,
+            content=audio_bytes,
+            content_type=content_type,
+        )
+        req = urllib.request.Request(
+            url=f"{self.api_base}/audio/transcriptions",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout_sec) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"转写请求失败: HTTP {e.code} {detail}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"转写请求失败: {e}") from e
+
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise RuntimeError("转写接口返回了无法解析的响应。") from e
+
+        text = str(parsed.get("text") or "").strip()
+        if not text:
+            raise RuntimeError("转写成功，但没有返回文本。")
+        return text
+
+
+class LocalWhisperAudioTranscriber(AudioTranscriber):
+    def __init__(
+        self,
+        model_name: str,
+        ffmpeg_bin: Optional[str] = None,
+        device: Optional[str] = None,
+        language: Optional[str] = None,
+        max_bytes: int = 25 * 1024 * 1024,
+    ):
+        self.model_name = model_name
+        self.ffmpeg_bin = ffmpeg_bin
+        self.device = device
+        self.language = language
+        self.max_bytes = max(1, int(max_bytes))
+        self._model = None
+        self._lock = threading.Lock()
+
+    def validate_environment(self) -> None:
+        try:
+            import whisper  # noqa: F401
+        except Exception as e:
+            raise RuntimeError("本地转写需要安装 whisper Python 包。") from e
+        self._resolve_ffmpeg_bin()
+
+    def _resolve_ffmpeg_bin(self) -> str:
+        configured = (self.ffmpeg_bin or "").strip()
+        if configured:
+            if Path(configured).exists():
+                return configured
+            raise RuntimeError(f"找不到 ffmpeg: {configured}")
+        found = shutil.which("ffmpeg")
+        if found:
+            return found
+        try:
+            import imageio_ffmpeg
+
+            return imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception as e:
+            raise RuntimeError("本地转写需要 ffmpeg，可安装系统 ffmpeg 或提供 TG_VOICE_FFMPEG_BIN。") from e
+
+    def _load_model(self):
+        with self._lock:
+            if self._model is not None:
+                return self._model
+            try:
+                import whisper
+            except Exception as e:
+                raise RuntimeError("本地转写需要安装 whisper Python 包。") from e
+            try:
+                self._model = whisper.load_model(self.model_name, device=self.device)
+            except Exception as e:
+                raise RuntimeError(f"加载本地 Whisper 模型失败: {e}") from e
+            return self._model
+
+    def _decode_audio(self, file_path: str):
+        ffmpeg_bin = self._resolve_ffmpeg_bin()
+        try:
+            import numpy as np
+            import whisper.audio as whisper_audio
+        except Exception as e:
+            raise RuntimeError("本地转写缺少 numpy/whisper 依赖。") from e
+
+        cmd = [
+            ffmpeg_bin,
+            "-nostdin",
+            "-threads",
+            "0",
+            "-i",
+            file_path,
+            "-f",
+            "s16le",
+            "-ac",
+            "1",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            str(whisper_audio.SAMPLE_RATE),
+            "-",
+        ]
+        try:
+            out = subprocess.run(cmd, capture_output=True, check=True).stdout
+        except subprocess.CalledProcessError as e:
+            detail = e.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"ffmpeg 解码失败: {detail}") from e
+        return np.frombuffer(out, np.int16).flatten().astype("float32") / 32768.0
+
+    def transcribe_telegram_audio(
+        self,
+        api: TelegramAPI,
+        *,
+        file_id: str,
+        file_name: Optional[str],
+        mime_type: Optional[str],
+        file_size: Optional[int],
+    ) -> str:
+        audio_bytes, normalized_name, _ = fetch_telegram_audio(
+            api,
+            file_id=file_id,
+            file_name=file_name,
+            mime_type=mime_type,
+            file_size=file_size,
+            max_bytes=self.max_bytes,
+        )
+        suffix = Path(normalized_name).suffix or ".ogg"
+        model = self._load_model()
+        with tempfile.NamedTemporaryFile(prefix="codex-tg-voice-", suffix=suffix, delete=True) as tmp:
+            tmp.write(audio_bytes)
+            tmp.flush()
+            audio = self._decode_audio(tmp.name)
+        try:
+            result = model.transcribe(
+                audio,
+                language=self.language or None,
+                fp16=False,
+                verbose=False,
+            )
+        except Exception as e:
+            raise RuntimeError(f"本地 Whisper 转写失败: {e}") from e
+        text = str((result or {}).get("text") or "").strip()
+        if not text:
+            raise RuntimeError("本地 Whisper 没有返回文本。")
+        return text
 
 
 @dataclass
@@ -902,6 +1196,7 @@ class TgCodexService:
         sessions: SessionStore,
         state: BotState,
         codex: CodexRunner,
+        audio_transcriber: Optional[AudioTranscriber],
         default_cwd: Path,
         allowed_user_ids: Optional[Set[int]],
         stream_enabled: bool,
@@ -913,6 +1208,7 @@ class TgCodexService:
         self.sessions = sessions
         self.state = state
         self.codex = codex
+        self.audio_transcriber = audio_transcriber
         self.default_cwd = default_cwd
         self.allowed_user_ids = allowed_user_ids
         self.stream_enabled = stream_enabled
@@ -955,6 +1251,9 @@ class TgCodexService:
         if not msg:
             return
         text = (msg.get("text") or "").strip()
+        caption = (msg.get("caption") or "").strip()
+        voice = msg.get("voice") if isinstance(msg.get("voice"), dict) else None
+        audio = msg.get("audio") if isinstance(msg.get("audio"), dict) else None
 
         chat_id = msg["chat"]["id"]
         message_id = msg["message_id"]
@@ -965,7 +1264,7 @@ class TgCodexService:
             return
         log(
             f"update received: user_id={user_id} chat_id={chat_id} "
-            f"text={text[:80]!r}"
+            f"text={text[:80]!r} voice={bool(voice)} audio={bool(audio)}"
         )
 
         if self.allowed_user_ids is not None and int(user_id) not in self.allowed_user_ids:
@@ -974,6 +1273,24 @@ class TgCodexService:
             return
 
         if not text:
+            if voice:
+                self._handle_audio_message(
+                    chat_id=chat_id,
+                    reply_to=message_id,
+                    user_id=int(user_id),
+                    media=voice,
+                    caption=caption,
+                    kind="voice",
+                )
+            elif audio:
+                self._handle_audio_message(
+                    chat_id=chat_id,
+                    reply_to=message_id,
+                    user_id=int(user_id),
+                    media=audio,
+                    caption=caption,
+                    kind="audio",
+                )
             return
         if not text.startswith("/"):
             if self._try_handle_quick_session_pick(chat_id, message_id, int(user_id), text):
@@ -1059,6 +1376,7 @@ class TgCodexService:
                     "执行 /sessions 后，也可点击按钮直接切换会话",
                     "后台执行时仍可发送 /use /sessions /status",
                     "直接发普通消息即可对话（会自动续聊当前 session）",
+                    "已配置转写时，也可直接发送 Telegram 语音或音频消息",
                 ]
             ),
             reply_to=reply_to,
@@ -1266,6 +1584,63 @@ class TgCodexService:
     def _handle_chat_message(self, chat_id: int, reply_to: int, user_id: int, text: str) -> None:
         self._run_prompt(chat_id, reply_to, user_id, text)
 
+    def _handle_audio_message(
+        self,
+        chat_id: int,
+        reply_to: int,
+        user_id: int,
+        media: Dict[str, Any],
+        caption: str,
+        kind: str,
+    ) -> None:
+        if self.audio_transcriber is None:
+            self.api.send_message(
+                chat_id,
+                "当前未配置语音转写。设置 OPENAI_API_KEY 后，可直接发送 Telegram 语音或音频消息。",
+                reply_to=reply_to,
+            )
+            return
+
+        file_id = str(media.get("file_id") or "").strip()
+        if not file_id:
+            self.api.send_message(chat_id, "无法读取这条语音消息的文件 ID。", reply_to=reply_to)
+            return
+
+        active_id, active_cwd = self.state.get_active(user_id)
+        cwd = Path(active_cwd).expanduser() if active_cwd else self.default_cwd
+        if not cwd.exists():
+            cwd = self.default_cwd
+        if not self.running_prompts.try_start(user_id, active_id):
+            busy_session = active_id[:8] if active_id else "当前线程"
+            self.api.send_message(
+                chat_id,
+                f"会话 {busy_session} 已有任务运行中。可先 /use 切到其他线程，或等待当前回复完成。",
+                reply_to=reply_to,
+            )
+            return
+
+        session_label = self._session_label(active_id, cwd)
+        log(
+            f"queue audio prompt: user_id={user_id} kind={kind} cwd={cwd} "
+            f"session={active_id} caption_len={len(caption)}"
+        )
+        if not self.stream_enabled:
+            self.api.send_message(
+                chat_id,
+                "已开始处理。\n可继续发送 /use、/sessions、/status。",
+                reply_to=reply_to,
+            )
+        worker = threading.Thread(
+            target=self._run_audio_prompt_worker,
+            args=(chat_id, reply_to, user_id, active_id, cwd, session_label, media, caption, kind),
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except Exception:
+            self.running_prompts.finish(user_id, active_id)
+            raise
+
     def _session_label(self, session_id: Optional[str], cwd: Path) -> str:
         resolved_cwd = cwd
         if session_id:
@@ -1288,8 +1663,7 @@ class TgCodexService:
 
     @staticmethod
     def _format_prompt_response(session_label: str, text: str) -> str:
-        body = (text or "Codex 没有返回可展示内容。").strip() or "Codex 没有返回可展示内容。"
-        return f"[{session_label}]\n\n{body}"
+        return (text or "Codex 没有返回可展示内容。").strip() or "Codex 没有返回可展示内容。"
 
     @staticmethod
     def _stream_preview_text(text: str) -> str:
@@ -1371,7 +1745,7 @@ class TgCodexService:
         if not self.stream_enabled:
             self.api.send_message(
                 chat_id,
-                f"已开始处理 [{session_label}]。\n可继续发送 /use、/sessions、/status。",
+                "已开始处理。\n可继续发送 /use、/sessions、/status。",
                 reply_to=reply_to,
             )
 
@@ -1559,6 +1933,74 @@ class TgCodexService:
 
         self.api.send_message(chat_id, answer, reply_to=reply_to)
 
+    def _run_audio_prompt_worker(
+        self,
+        chat_id: int,
+        reply_to: int,
+        user_id: int,
+        active_id: Optional[str],
+        cwd: Path,
+        session_label: str,
+        media: Dict[str, Any],
+        caption: str,
+        kind: str,
+    ) -> None:
+        if self.audio_transcriber is None:
+            self.running_prompts.finish(user_id, active_id)
+            self.api.send_message(
+                chat_id,
+                "当前未配置语音转写。设置 OPENAI_API_KEY 后，可直接发送 Telegram 语音或音频消息。",
+                reply_to=reply_to,
+            )
+            return
+
+        file_id = str(media.get("file_id") or "").strip()
+        file_name = media.get("file_name")
+        mime_type = media.get("mime_type")
+        file_size_raw = media.get("file_size")
+        file_size = file_size_raw if isinstance(file_size_raw, int) else None
+
+        typing = TypingStatus(self.api, chat_id)
+        typing.start()
+        try:
+            transcript = self.audio_transcriber.transcribe_telegram_audio(
+                self.api,
+                file_id=file_id,
+                file_name=str(file_name).strip() if file_name else None,
+                mime_type=str(mime_type).strip() if mime_type else None,
+                file_size=file_size,
+            )
+        except Exception as e:
+            log(f"audio transcription failed: user_id={user_id} kind={kind} error={e}")
+            self.api.send_message(chat_id, f"语音转写失败: {e}", reply_to=reply_to)
+            self.running_prompts.finish(user_id, active_id)
+            return
+        finally:
+            typing.stop()
+
+        transcript = transcript.strip()
+        if not transcript:
+            self.api.send_message(chat_id, "语音转写结果为空，未继续发送给 Codex。", reply_to=reply_to)
+            self.running_prompts.finish(user_id, active_id)
+            return
+
+        prompt = transcript
+        if caption:
+            prompt = f"附加说明:\n{caption}\n\n语音转写:\n{transcript}"
+        log(
+            f"audio transcription finished: user_id={user_id} kind={kind} "
+            f"session={active_id} transcript_len={len(transcript)}"
+        )
+        self._run_prompt_worker(
+            chat_id=chat_id,
+            reply_to=reply_to,
+            user_id=user_id,
+            prompt=prompt,
+            active_id=active_id,
+            cwd=cwd,
+            session_label=session_label,
+        )
+
 
 def resolve_codex_bin(configured: Optional[str]) -> str:
     if configured:
@@ -1588,6 +2030,18 @@ def build_service() -> TgCodexService:
         env("CODEX_IDLE_TIMEOUT_SEC", env("CODEX_EXEC_TIMEOUT_SEC", "3600")),
         3600,
     )
+    openai_api_key = env("OPENAI_API_KEY")
+    openai_api_base = env("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    tg_voice_enabled_raw = env("TG_VOICE_TRANSCRIBE_ENABLED")
+    tg_voice_enabled = True if tg_voice_enabled_raw is None else tg_voice_enabled_raw == "1"
+    tg_voice_backend = env("TG_VOICE_TRANSCRIBE_BACKEND", "local-whisper")
+    tg_voice_model = env("TG_VOICE_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
+    tg_voice_timeout_sec = parse_non_negative_int(env("TG_VOICE_TRANSCRIBE_TIMEOUT_SEC", "180"), 180)
+    tg_voice_max_bytes = parse_non_negative_int(env("TG_VOICE_MAX_BYTES", "26214400"), 26214400)
+    tg_voice_local_model = env("TG_VOICE_LOCAL_MODEL", "base")
+    tg_voice_local_device = env("TG_VOICE_LOCAL_DEVICE", "cpu")
+    tg_voice_local_language = env("TG_VOICE_LOCAL_LANGUAGE")
+    tg_voice_ffmpeg_bin = env("TG_VOICE_FFMPEG_BIN")
     default_cwd = Path(env("DEFAULT_CWD", os.getcwd())).expanduser()
     ca_bundle = env("TELEGRAM_CA_BUNDLE")
     insecure_skip_verify = env("TELEGRAM_INSECURE_SKIP_VERIFY", "0") == "1"
@@ -1610,6 +2064,60 @@ def build_service() -> TgCodexService:
         dangerous_bypass_level=codex_dangerous_bypass_level,
         idle_timeout_sec=codex_idle_timeout_sec,
     )
+    audio_transcriber: Optional[AudioTranscriber] = None
+    voice_backend_label = "disabled"
+    if tg_voice_enabled:
+        backend = (tg_voice_backend or "auto").strip().lower()
+        if backend == "local-whisper":
+            try:
+                local_transcriber = LocalWhisperAudioTranscriber(
+                    model_name=tg_voice_local_model,
+                    ffmpeg_bin=tg_voice_ffmpeg_bin,
+                    device=tg_voice_local_device,
+                    language=tg_voice_local_language,
+                    max_bytes=tg_voice_max_bytes,
+                )
+                local_transcriber.validate_environment()
+                audio_transcriber = local_transcriber
+                voice_backend_label = f"local-whisper:{tg_voice_local_model}"
+            except Exception as e:
+                voice_backend_label = f"local-whisper-unavailable:{e}"
+        elif backend == "openai":
+            if openai_api_key:
+                audio_transcriber = OpenAIAudioTranscriber(
+                    api_key=openai_api_key,
+                    model=tg_voice_model,
+                    api_base=openai_api_base,
+                    timeout_sec=tg_voice_timeout_sec,
+                    max_bytes=tg_voice_max_bytes,
+                )
+                voice_backend_label = f"openai:{tg_voice_model}"
+            else:
+                voice_backend_label = "openai-missing-key"
+        else:
+            try:
+                local_transcriber = LocalWhisperAudioTranscriber(
+                    model_name=tg_voice_local_model,
+                    ffmpeg_bin=tg_voice_ffmpeg_bin,
+                    device=tg_voice_local_device,
+                    language=tg_voice_local_language,
+                    max_bytes=tg_voice_max_bytes,
+                )
+                local_transcriber.validate_environment()
+                audio_transcriber = local_transcriber
+                voice_backend_label = f"local-whisper:{tg_voice_local_model}"
+            except Exception:
+                if openai_api_key:
+                    audio_transcriber = OpenAIAudioTranscriber(
+                        api_key=openai_api_key,
+                        model=tg_voice_model,
+                        api_base=openai_api_base,
+                        timeout_sec=tg_voice_timeout_sec,
+                        max_bytes=tg_voice_max_bytes,
+                    )
+                    voice_backend_label = f"openai:{tg_voice_model}"
+                else:
+                    voice_backend_label = "auto-unavailable"
     if codex_dangerous_bypass_level == 1:
         log("[warn] CODEX_DANGEROUS_BYPASS=1, enabling sandbox_mode=danger-full-access and approval_policy=never")
     elif codex_dangerous_bypass_level >= 2:
@@ -1627,12 +2135,22 @@ def build_service() -> TgCodexService:
         log(f"[info] Codex idle timeout enabled ({codex_idle_timeout_sec}s)")
     else:
         log("[warn] Codex idle timeout disabled")
+    if tg_voice_enabled and audio_transcriber is not None:
+        log(
+            "[info] Telegram voice transcription enabled "
+            f"(backend: {voice_backend_label}, max bytes: {tg_voice_max_bytes})"
+        )
+    elif tg_voice_enabled:
+        log(f"[warn] Telegram voice transcription requested, but backend is unavailable ({voice_backend_label})")
+    else:
+        log("[info] Telegram voice transcription disabled")
 
     return TgCodexService(
         api=api,
         sessions=sessions,
         state=state,
         codex=codex,
+        audio_transcriber=audio_transcriber,
         default_cwd=default_cwd,
         allowed_user_ids=allowed_user_ids,
         stream_enabled=tg_stream_enabled,

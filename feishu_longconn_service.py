@@ -867,8 +867,7 @@ class FeishuCodexService:
 
     @staticmethod
     def _format_prompt_response(session_label: str, text: str) -> str:
-        body = (text or "Codex 没有返回可展示内容。").strip() or "Codex 没有返回可展示内容。"
-        return f"**{session_label}**\n\n{body}"
+        return (text or "Codex 没有返回可展示内容。").strip() or "Codex 没有返回可展示内容。"
 
     @staticmethod
     def _stream_preview_text(text: str) -> str:
@@ -945,7 +944,7 @@ class FeishuCodexService:
         if not self.stream_enabled or not self.api.rich_message_enabled:
             self.api.send_message(
                 chat_id,
-                f"已开始处理 [{session_label}]。\n可继续发送 /use、/sessions、/status。",
+                "已开始处理。\n可继续发送 /use、/sessions、/status。",
             )
 
         worker = threading.Thread(

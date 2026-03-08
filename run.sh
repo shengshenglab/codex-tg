@@ -32,6 +32,17 @@ TG_STREAM_ENABLED="${TG_STREAM_ENABLED:-1}"
 TG_STREAM_EDIT_INTERVAL_MS="${TG_STREAM_EDIT_INTERVAL_MS:-300}"
 TG_STREAM_MIN_DELTA_CHARS="${TG_STREAM_MIN_DELTA_CHARS:-8}"
 TG_THINKING_STATUS_INTERVAL_MS="${TG_THINKING_STATUS_INTERVAL_MS:-700}"
+TG_VOICE_TRANSCRIBE_ENABLED="${TG_VOICE_TRANSCRIBE_ENABLED:-}"
+TG_VOICE_TRANSCRIBE_BACKEND="${TG_VOICE_TRANSCRIBE_BACKEND:-local-whisper}"
+TG_VOICE_TRANSCRIBE_MODEL="${TG_VOICE_TRANSCRIBE_MODEL:-gpt-4o-mini-transcribe}"
+TG_VOICE_TRANSCRIBE_TIMEOUT_SEC="${TG_VOICE_TRANSCRIBE_TIMEOUT_SEC:-180}"
+TG_VOICE_MAX_BYTES="${TG_VOICE_MAX_BYTES:-26214400}"
+TG_VOICE_LOCAL_MODEL="${TG_VOICE_LOCAL_MODEL:-base}"
+TG_VOICE_LOCAL_DEVICE="${TG_VOICE_LOCAL_DEVICE:-cpu}"
+TG_VOICE_LOCAL_LANGUAGE="${TG_VOICE_LOCAL_LANGUAGE:-}"
+TG_VOICE_FFMPEG_BIN="${TG_VOICE_FFMPEG_BIN:-}"
+OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+OPENAI_BASE_URL="${OPENAI_BASE_URL:-}"
 
 # Feishu env
 FEISHU_APP_ID="${FEISHU_APP_ID:-}"
@@ -73,6 +84,64 @@ validate_shared_config() {
   if [[ ! -x "$CODEX_BIN" ]]; then
     echo "[error] CODEX_BIN 不存在或不可执行: $CODEX_BIN"
     exit 1
+  fi
+}
+
+probe_tg_local_voice_env() {
+  "$PYTHON_BIN" - <<'PY'
+import importlib.util
+import shutil
+
+has_whisper = importlib.util.find_spec("whisper") is not None
+has_ffmpeg = bool(shutil.which("ffmpeg"))
+if not has_ffmpeg:
+    try:
+        import imageio_ffmpeg
+        imageio_ffmpeg.get_ffmpeg_exe()
+        has_ffmpeg = True
+    except Exception:
+        has_ffmpeg = False
+print(f"{int(has_whisper)} {int(has_ffmpeg)}")
+PY
+}
+
+configure_tg_voice_defaults() {
+  if ! has_tg_config; then
+    return 0
+  fi
+
+  local probe_result has_whisper has_ffmpeg
+  probe_result="$(probe_tg_local_voice_env)"
+  read -r has_whisper has_ffmpeg <<<"$probe_result"
+
+  if [[ -z "$TG_VOICE_TRANSCRIBE_ENABLED" ]]; then
+    if [[ "$has_whisper" == "1" && "$has_ffmpeg" == "1" ]]; then
+      TG_VOICE_TRANSCRIBE_ENABLED="1"
+      TG_VOICE_TRANSCRIBE_BACKEND="local-whisper"
+      echo "[info] 检测到本地 Whisper 环境，已默认启用 Telegram 本地语音转写"
+    else
+      TG_VOICE_TRANSCRIBE_ENABLED="0"
+      echo "[warn] 未检测到完整的本地语音转写环境，Telegram 语音转写默认未启用"
+      if [[ "$has_whisper" != "1" ]]; then
+        echo "[warn] 缺少 whisper Python 包，安装命令：python3 -m pip install --user -U openai-whisper torch"
+      fi
+      if [[ "$has_ffmpeg" != "1" ]]; then
+        echo "[warn] 缺少 ffmpeg，安装命令：brew install ffmpeg"
+      fi
+    fi
+    return 0
+  fi
+
+  if [[ "$TG_VOICE_TRANSCRIBE_ENABLED" == "1" && "$TG_VOICE_TRANSCRIBE_BACKEND" == "local-whisper" ]]; then
+    if [[ "$has_whisper" != "1" || "$has_ffmpeg" != "1" ]]; then
+      echo "[warn] 已启用本地语音转写，但当前环境不完整，bot 启动后会禁用该功能"
+      if [[ "$has_whisper" != "1" ]]; then
+        echo "[warn] 安装 whisper：python3 -m pip install --user -U openai-whisper torch"
+      fi
+      if [[ "$has_ffmpeg" != "1" ]]; then
+        echo "[warn] 安装 ffmpeg：brew install ffmpeg"
+      fi
+    fi
   fi
 }
 
@@ -119,6 +188,17 @@ tg_start() {
     TG_STREAM_EDIT_INTERVAL_MS="$TG_STREAM_EDIT_INTERVAL_MS" \
     TG_STREAM_MIN_DELTA_CHARS="$TG_STREAM_MIN_DELTA_CHARS" \
     TG_THINKING_STATUS_INTERVAL_MS="$TG_THINKING_STATUS_INTERVAL_MS" \
+    TG_VOICE_TRANSCRIBE_ENABLED="$TG_VOICE_TRANSCRIBE_ENABLED" \
+    TG_VOICE_TRANSCRIBE_BACKEND="$TG_VOICE_TRANSCRIBE_BACKEND" \
+    TG_VOICE_TRANSCRIBE_MODEL="$TG_VOICE_TRANSCRIBE_MODEL" \
+    TG_VOICE_TRANSCRIBE_TIMEOUT_SEC="$TG_VOICE_TRANSCRIBE_TIMEOUT_SEC" \
+    TG_VOICE_MAX_BYTES="$TG_VOICE_MAX_BYTES" \
+    TG_VOICE_LOCAL_MODEL="$TG_VOICE_LOCAL_MODEL" \
+    TG_VOICE_LOCAL_DEVICE="$TG_VOICE_LOCAL_DEVICE" \
+    TG_VOICE_LOCAL_LANGUAGE="$TG_VOICE_LOCAL_LANGUAGE" \
+    TG_VOICE_FFMPEG_BIN="$TG_VOICE_FFMPEG_BIN" \
+    OPENAI_API_KEY="$OPENAI_API_KEY" \
+    OPENAI_BASE_URL="$OPENAI_BASE_URL" \
     "$PYTHON_BIN" -u "$TG_BOT_SCRIPT" >>"$TG_LOG_FILE" 2>&1 &
 
   local pid=$!
@@ -185,6 +265,7 @@ start() {
   validate_tg_config
   validate_feishu_config
   validate_shared_config
+  configure_tg_voice_defaults
 
   if [[ "${CODEX_DANGEROUS_BYPASS}" == "0" ]]; then
     echo "[info] 当前 CODEX_DANGEROUS_BYPASS=0（不追加权限参数）"
