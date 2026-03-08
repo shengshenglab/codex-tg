@@ -19,6 +19,7 @@ except ImportError as err:  # pragma: no cover
 from tg_codex_bot import (
     BotState,
     CodexRunner,
+    RunningPromptRegistry,
     SessionStore,
     parse_dangerous_bypass_level,
     resolve_codex_bin,
@@ -489,6 +490,7 @@ class FeishuCodexService:
         self.stream_edit_interval_ms = max(250, stream_edit_interval_ms)
         self.stream_min_delta_chars = max(1, stream_min_delta_chars)
         self.thinking_status_interval_ms = max(500, thinking_status_interval_ms)
+        self.running_prompts = RunningPromptRegistry()
         self.startup_time_ms = int(time.time() * 1000)
         self.seen_event_ids: Set[str] = set()
         self.seen_message_ids: Set[str] = set()
@@ -612,7 +614,7 @@ class FeishuCodexService:
         if not text.startswith("/"):
             if self._try_handle_quick_session_pick(chat_id, actor_id, text):
                 return
-            self.state.set_pending_session_pick(actor_id, False)  # type: ignore[arg-type]
+            self.state.set_pending_session_pick(actor_id, False)
             self._run_prompt(chat_id, actor_id, text)
             return
 
@@ -661,6 +663,7 @@ class FeishuCodexService:
                     "/status - 查看当前绑定会话",
                     "/ask <内容> - 手动提问（可选）",
                     "执行 /sessions 后，可直接发送编号切换会话",
+                    "后台执行时仍可发送 /use /sessions /status",
                     "直接发普通消息即可对话（会自动续聊当前 session）",
                 ]
             ),
@@ -686,8 +689,8 @@ class FeishuCodexService:
             lines.append(f"{i}. {s.title} | {short_id} | {cwd_name}")
         lines.append("直接发送编号即可切换（例如发送: 1）")
         self.api.send_message(chat_id, "\n".join(lines))
-        self.state.set_last_session_ids(actor_id, session_ids)  # type: ignore[arg-type]
-        self.state.set_pending_session_pick(actor_id, True)  # type: ignore[arg-type]
+        self.state.set_last_session_ids(actor_id, session_ids)
+        self.state.set_pending_session_pick(actor_id, True)
 
     def _handle_use(self, chat_id: str, actor_id: str, arg: str) -> None:
         selector = arg.strip()
@@ -708,21 +711,21 @@ class FeishuCodexService:
         if not meta:
             self.api.send_message(chat_id, f"未找到 session: {session_id}")
             return
-        self.state.set_active_session(actor_id, meta.session_id, meta.cwd)  # type: ignore[arg-type]
-        self.state.set_pending_session_pick(actor_id, False)  # type: ignore[arg-type]
+        self.state.set_active_session(actor_id, meta.session_id, meta.cwd)
+        self.state.set_pending_session_pick(actor_id, False)
         self.api.send_message(
             chat_id,
             f"已切换到:\n{meta.title}\nsession: {meta.session_id}\ncwd: {meta.cwd}\n现在可直接发消息对话。",
         )
 
     def _try_handle_quick_session_pick(self, chat_id: str, actor_id: str, text: str) -> bool:
-        if not self.state.is_pending_session_pick(actor_id):  # type: ignore[arg-type]
+        if not self.state.is_pending_session_pick(actor_id):
             return False
         raw = text.strip()
         if not raw.isdigit():
             return False
         idx = int(raw)
-        recent_ids = self.state.get_last_session_ids(actor_id)  # type: ignore[arg-type]
+        recent_ids = self.state.get_last_session_ids(actor_id)
         if idx <= 0 or idx > len(recent_ids):
             self.api.send_message(chat_id, "编号无效。请发送 /sessions 重新查看列表。")
             return True
@@ -735,7 +738,7 @@ class FeishuCodexService:
         session_id: Optional[str] = None
 
         if not tokens:
-            session_id, _ = self.state.get_active(actor_id)  # type: ignore[arg-type]
+            session_id, _ = self.state.get_active(actor_id)
             if not session_id:
                 self.api.send_message(
                     chat_id,
@@ -782,27 +785,40 @@ class FeishuCodexService:
             return None, "示例: /use 1 或 /use <session_id>"
         if raw.isdigit():
             idx = int(raw)
-            recent_ids = self.state.get_last_session_ids(actor_id)  # type: ignore[arg-type]
+            recent_ids = self.state.get_last_session_ids(actor_id)
             if idx <= 0 or idx > len(recent_ids):
                 return None, "编号无效。先执行 /sessions，再用编号。"
             return recent_ids[idx - 1], None
         return raw, None
 
     def _handle_status(self, chat_id: str, actor_id: str) -> None:
-        session_id, cwd = self.state.get_active(actor_id)  # type: ignore[arg-type]
+        session_id, cwd = self.state.get_active(actor_id)
+        running_count = self.running_prompts.count(actor_id)
         if not session_id:
+            message = "当前没有绑定会话。可先 /sessions + /use，或 /new 后直接发消息。"
+            if running_count > 0:
+                message += f"\n后台仍有 {running_count} 个任务运行，可继续 /use 切线程。"
             self.api.send_message(
                 chat_id,
-                "当前没有绑定会话。可先 /sessions + /use，或 /new 后直接发消息。",
+                message,
             )
             return
         title = f"session {session_id[:8]}"
         meta = self.sessions.find_by_id(session_id)
         if meta:
             title = meta.title
+        lines = [
+            "当前会话:",
+            title,
+            f"session: {session_id}",
+            f"cwd: {cwd or str(self.default_cwd)}",
+            "支持与本地 Codex 客户端交替续聊。",
+        ]
+        if running_count > 0:
+            lines.append(f"后台运行中: {running_count} 个任务（可继续 /use 切线程）")
         self.api.send_message(
             chat_id,
-            f"当前会话:\n{title}\nsession: {session_id}\ncwd: {cwd or str(self.default_cwd)}\n支持与本地 Codex 客户端交替续聊。",
+            "\n".join(lines),
         )
 
     def _handle_ask(self, chat_id: str, actor_id: str, arg: str) -> None:
@@ -814,7 +830,7 @@ class FeishuCodexService:
 
     def _handle_new(self, chat_id: str, actor_id: str, arg: str) -> None:
         cwd_raw = arg.strip()
-        _, current_cwd = self.state.get_active(actor_id)  # type: ignore[arg-type]
+        _, current_cwd = self.state.get_active(actor_id)
         target_cwd = Path(current_cwd).expanduser() if current_cwd else self.default_cwd
         if cwd_raw:
             candidate = Path(cwd_raw).expanduser()
@@ -822,12 +838,37 @@ class FeishuCodexService:
                 self.api.send_message(chat_id, f"cwd 不存在或不是目录: {candidate}")
                 return
             target_cwd = candidate
-        self.state.clear_active_session(actor_id, str(target_cwd))  # type: ignore[arg-type]
-        self.state.set_pending_session_pick(actor_id, False)  # type: ignore[arg-type]
+        self.state.clear_active_session(actor_id, str(target_cwd))
+        self.state.set_pending_session_pick(actor_id, False)
         self.api.send_message(
             chat_id,
             f"已进入新会话模式，cwd: {target_cwd}\n下一条普通消息会创建一个新 session。",
         )
+
+    def _session_label(self, session_id: Optional[str], cwd: Path) -> str:
+        resolved_cwd = cwd
+        if session_id:
+            meta = self.sessions.find_by_id(session_id)
+            title = meta.title if meta else f"session {session_id[:8]}"
+            if meta and meta.cwd:
+                resolved_cwd = Path(meta.cwd)
+        else:
+            title = "新会话"
+        cwd_name = resolved_cwd.name or str(resolved_cwd)
+        if session_id:
+            return f"{title} | {session_id[:8]} | {cwd_name}"
+        return f"{title} | {cwd_name}"
+
+    def _initial_prompt_status(self, session_label: str, active_id: Optional[str], elapsed: Optional[int] = None) -> str:
+        body = "思考中..."
+        if elapsed is not None:
+            body = f"{body}\n\n已等待 {elapsed}s"
+        return self._format_prompt_response(session_label, body)
+
+    @staticmethod
+    def _format_prompt_response(session_label: str, text: str) -> str:
+        body = (text or "Codex 没有返回可展示内容。").strip() or "Codex 没有返回可展示内容。"
+        return f"**{session_label}**\n\n{body}"
 
     @staticmethod
     def _stream_preview_text(text: str) -> str:
@@ -886,13 +927,47 @@ class FeishuCodexService:
             self.api.send_agent_message(chat_id, part, title=chunk_title)
 
     def _run_prompt(self, chat_id: str, actor_id: str, prompt: str) -> None:
-        active_id, active_cwd = self.state.get_active(actor_id)  # type: ignore[arg-type]
+        active_id, active_cwd = self.state.get_active(actor_id)
         cwd = Path(active_cwd).expanduser() if active_cwd else self.default_cwd
         if not cwd.exists():
             cwd = self.default_cwd
+        if not self.running_prompts.try_start(actor_id, active_id):
+            busy_session = active_id[:8] if active_id else "当前线程"
+            self.api.send_message(
+                chat_id,
+                f"会话 {busy_session} 已有任务运行中。可先 /use 切到其他线程，或等待当前回复完成。",
+            )
+            return
 
+        session_label = self._session_label(active_id, cwd)
         mode = "继续当前会话" if active_id else "新建会话"
-        log(f"run prompt: actor={actor_id} mode={mode} cwd={cwd} session={active_id}")
+        log(f"queue prompt: actor={actor_id} mode={mode} cwd={cwd} session={active_id}")
+        if not self.stream_enabled or not self.api.rich_message_enabled:
+            self.api.send_message(
+                chat_id,
+                f"已开始处理 [{session_label}]。\n可继续发送 /use、/sessions、/status。",
+            )
+
+        worker = threading.Thread(
+            target=self._run_prompt_worker,
+            args=(chat_id, actor_id, prompt, active_id, cwd, session_label),
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except Exception:
+            self.running_prompts.finish(actor_id, active_id)
+            raise
+
+    def _run_prompt_worker(
+        self,
+        chat_id: str,
+        actor_id: str,
+        prompt: str,
+        active_id: Optional[str],
+        cwd: Path,
+        session_label: str,
+    ) -> None:
         stream_message_id: Optional[str] = None
         stream_state: Dict[str, Any] = {
             "last_preview": "",
@@ -904,6 +979,8 @@ class FeishuCodexService:
         thinking_stop = threading.Event()
         first_output = threading.Event()
         thinking_thread: Optional[threading.Thread] = None
+        run_started_at = time.time()
+        first_output_at: List[float] = []
 
         def patch_stream_message(text: str) -> bool:
             nonlocal stream_message_id
@@ -920,7 +997,10 @@ class FeishuCodexService:
             return True
 
         if use_stream:
-            placeholder_id = self.api.send_agent_message_with_id(chat_id, "思考中...")
+            placeholder_id = self.api.send_agent_message_with_id(
+                chat_id,
+                self._initial_prompt_status(session_label, active_id),
+            )
             if placeholder_id:
                 stream_message_id = placeholder_id
             else:
@@ -934,7 +1014,10 @@ class FeishuCodexService:
                 if first_output.is_set():
                     return
                 elapsed = int(time.time() - start_ts)
-                status_text = f"{phases[i % len(phases)]}\n\n已等待 {elapsed}s"
+                status_text = self._format_prompt_response(
+                    session_label,
+                    f"{phases[i % len(phases)]}\n\n已等待 {elapsed}s",
+                )
                 i += 1
                 if not patch_stream_message(status_text):
                     return
@@ -945,9 +1028,14 @@ class FeishuCodexService:
 
         def on_update(live_text: str) -> None:
             first_output.set()
+            if not first_output_at:
+                first_output_at.append(time.time())
             if not use_stream or not stream_message_id:
                 return
-            preview = self._stream_preview_text(live_text)
+            preview = self._format_prompt_response(
+                session_label,
+                self._stream_preview_text(live_text),
+            )
             now_ms = int(time.time() * 1000)
             last_preview = str(stream_state.get("last_preview") or "")
             last_emit_at_ms = int(stream_state.get("last_emit_at_ms") or 0)
@@ -974,30 +1062,60 @@ class FeishuCodexService:
             thinking_stop.set()
             if thinking_thread is not None:
                 thinking_thread.join(timeout=0.3)
-            err_msg = f"调用 Codex 时出现异常: {e}"
+            err_msg = self._format_prompt_response(
+                session_label,
+                f"调用 Codex 时出现异常: {e}",
+            )
             if use_stream and stream_message_id:
                 self._finalize_stream_reply(chat_id, stream_message_id, err_msg, progressive_replay=False)
             else:
-                self.api.send_message(chat_id, err_msg)
+                self.api.send_agent_message(chat_id, err_msg)
             return
         finally:
             thinking_stop.set()
             if thinking_thread is not None:
                 thinking_thread.join(timeout=0.3)
+            self.running_prompts.finish(actor_id, active_id)
 
+        elapsed_sec = round(time.time() - run_started_at, 2)
+        first_output_sec = round(first_output_at[0] - run_started_at, 2) if first_output_at else None
+        log(
+            "prompt finished: "
+            f"actor={actor_id} session={active_id} thread={thread_id} exit={return_code} "
+            f"elapsed_sec={elapsed_sec} first_output_sec={first_output_sec}"
+        )
+
+        final_session_id = thread_id or active_id
+        final_session_label = self._session_label(final_session_id, cwd)
+        session_updated = False
         if thread_id:
-            self.state.set_active_session(actor_id, thread_id, str(cwd))  # type: ignore[arg-type]
+            session_updated = self.state.update_active_session_if_unchanged(
+                actor_id,
+                active_id,
+                thread_id,
+                str(cwd),
+            )
 
         if return_code != 0:
             msg = f"Codex 执行失败 (exit={return_code})\n{answer}"
             if stderr_text:
                 msg += f"\n\nstderr:\n{stderr_text[-1200:]}"
+            msg = self._format_prompt_response(final_session_label, msg)
             if use_stream and stream_message_id:
                 self._finalize_stream_reply(chat_id, stream_message_id, msg, progressive_replay=False)
             else:
-                self.api.send_message(chat_id, msg)
+                self.api.send_agent_message(chat_id, msg)
             return
 
+        if thread_id and not session_updated:
+            current_active_id, _ = self.state.get_active(actor_id)
+            if current_active_id != thread_id:
+                note = "当前活动线程未变；这是后台线程的回复。"
+                if not active_id:
+                    note = "新线程已创建，但你已经切到别的线程，当前活动线程未变。"
+                answer = f"{note}\n\n{answer}"
+
+        answer = self._format_prompt_response(final_session_label, answer)
         if use_stream and stream_message_id:
             replay = int(stream_state.get("content_updates") or 0) == 0
             self._finalize_stream_reply(chat_id, stream_message_id, answer, progressive_replay=replay)
@@ -1019,6 +1137,10 @@ def build_service() -> FeishuCodexService:
     codex_sandbox_mode = env("CODEX_SANDBOX_MODE")
     codex_approval_policy = env("CODEX_APPROVAL_POLICY")
     codex_dangerous_bypass_level = parse_dangerous_bypass_level(env("CODEX_DANGEROUS_BYPASS", "0"))
+    codex_idle_timeout_sec = parse_non_negative_int(
+        env("CODEX_IDLE_TIMEOUT_SEC", env("CODEX_EXEC_TIMEOUT_SEC", "3600")),
+        3600,
+    )
     default_cwd = Path(env("DEFAULT_CWD", os.getcwd())).expanduser()
     enable_p2p = env("FEISHU_ENABLE_P2P", "0") == "1"
     log_level = env("FEISHU_LOG_LEVEL", "INFO") or "INFO"
@@ -1054,11 +1176,16 @@ def build_service() -> FeishuCodexService:
         sandbox_mode=codex_sandbox_mode,
         approval_policy=codex_approval_policy,
         dangerous_bypass_level=codex_dangerous_bypass_level,
+        idle_timeout_sec=codex_idle_timeout_sec,
     )
     if codex_dangerous_bypass_level == 1:
         log("[warn] CODEX_DANGEROUS_BYPASS=1, enabling sandbox_mode=danger-full-access and approval_policy=never")
     elif codex_dangerous_bypass_level >= 2:
         log("[warn] CODEX_DANGEROUS_BYPASS=2, approvals and sandbox are fully bypassed")
+    if codex_idle_timeout_sec > 0:
+        log(f"[info] Codex idle timeout enabled ({codex_idle_timeout_sec}s)")
+    else:
+        log("[warn] Codex idle timeout disabled")
 
     return FeishuCodexService(
         api=api,

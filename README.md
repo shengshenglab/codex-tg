@@ -8,6 +8,7 @@ Language: English | [简体中文](README.zh-CN.md)
 
 - List local session history with titles
 - Switch to an existing session and continue asking
+- Keep receiving commands while a session is running, and switch to another thread
 - Create new sessions and control working directory
 - View recent messages in a session (`/history`)
 - Run Telegram only, Feishu only, or both at the same time
@@ -44,6 +45,7 @@ export CODEX_SESSION_ROOT="$HOME/.codex/sessions"
 export CODEX_SANDBOX_MODE=""                         # optional: used only when CODEX_DANGEROUS_BYPASS=1
 export CODEX_APPROVAL_POLICY=""                      # optional: used only when CODEX_DANGEROUS_BYPASS=1
 export CODEX_DANGEROUS_BYPASS=0                      # 0/1/2 (see permission section below)
+export CODEX_IDLE_TIMEOUT_SEC=3600                  # optional: kill codex exec after this many idle seconds with no output; 0 disables it
 ```
 
 ### 2) Start services
@@ -125,6 +127,7 @@ Risk notes:
 Tips:
 
 - After `/sessions`, send an index directly (for example `1`) to switch
+- During long-running tasks, you can still send `/use`, `/sessions`, and `/status`
 - In Feishu group chats, it is recommended to `@bot` before sending commands
 
 ## Additional Scripts
@@ -137,4 +140,4 @@ Tips:
 
 - New sessions are mainly visible in terminal/CLI session history
 - Codex Desktop may need restart before newly continued sessions become visible
-- Replies are returned after each request finishes (no streaming push yet)
+- Only one in-flight task is allowed per session; switch to another thread for parallel work

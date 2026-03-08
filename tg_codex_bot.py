@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import signal
 import shutil
 import ssl
 import subprocess
@@ -13,7 +14,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 
 MAX_TELEGRAM_TEXT = 4096
@@ -208,6 +209,9 @@ class SessionMeta:
     title: str
 
 
+StateActor = Union[int, str]
+
+
 class TypingStatus:
     def __init__(self, api: TelegramAPI, chat_id: int, interval_sec: float = 4.0):
         self.api = api
@@ -394,65 +398,149 @@ class BotState:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.data: Dict[str, Any] = {"users": {}}
+        self._lock = threading.RLock()
         self._load()
 
     def _load(self) -> None:
-        if not self.path.exists():
-            return
-        try:
-            self.data = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
-            self.data = {"users": {}}
+        with self._lock:
+            if not self.path.exists():
+                return
+            try:
+                self.data = json.loads(self.path.read_text(encoding="utf-8"))
+            except Exception:
+                self.data = {"users": {}}
 
-    def save(self) -> None:
+    @staticmethod
+    def _normalize_session_id(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def _save_unlocked(self) -> None:
         self.path.write_text(
             json.dumps(self.data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
-    def get_user(self, user_id: int) -> Dict[str, Any]:
+    def save(self) -> None:
+        with self._lock:
+            self._save_unlocked()
+
+    def _get_user_unlocked(self, user_id: StateActor) -> Dict[str, Any]:
         users = self.data.setdefault("users", {})
         key = str(user_id)
         if key not in users:
             users[key] = {}
         return users[key]
 
-    def set_active_session(self, user_id: int, session_id: str, cwd: str) -> None:
-        user_data = self.get_user(user_id)
-        user_data["active_session_id"] = session_id
-        user_data["active_cwd"] = cwd
-        self.save()
+    def set_active_session(self, user_id: StateActor, session_id: str, cwd: str) -> None:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            user_data["active_session_id"] = session_id
+            user_data["active_cwd"] = cwd
+            self._save_unlocked()
 
-    def clear_active_session(self, user_id: int, cwd: str) -> None:
-        user_data = self.get_user(user_id)
-        user_data["active_session_id"] = None
-        user_data["active_cwd"] = cwd
-        self.save()
+    def clear_active_session(self, user_id: StateActor, cwd: str) -> None:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            user_data["active_session_id"] = None
+            user_data["active_cwd"] = cwd
+            self._save_unlocked()
 
-    def get_active(self, user_id: int) -> Tuple[Optional[str], Optional[str]]:
-        user_data = self.get_user(user_id)
-        return user_data.get("active_session_id"), user_data.get("active_cwd")
+    def get_active(self, user_id: StateActor) -> Tuple[Optional[str], Optional[str]]:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            session_id = self._normalize_session_id(user_data.get("active_session_id"))
+            cwd = str(user_data.get("active_cwd") or "").strip() or None
+            return session_id, cwd
 
-    def set_last_session_ids(self, user_id: int, session_ids: List[str]) -> None:
-        user_data = self.get_user(user_id)
-        user_data["last_session_ids"] = session_ids
-        self.save()
+    def set_last_session_ids(self, user_id: StateActor, session_ids: List[str]) -> None:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            user_data["last_session_ids"] = session_ids
+            self._save_unlocked()
 
-    def get_last_session_ids(self, user_id: int) -> List[str]:
-        user_data = self.get_user(user_id)
-        values = user_data.get("last_session_ids")
-        if not isinstance(values, list):
-            return []
-        return [str(v) for v in values]
+    def get_last_session_ids(self, user_id: StateActor) -> List[str]:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            values = user_data.get("last_session_ids")
+            if not isinstance(values, list):
+                return []
+            return [str(v) for v in values]
 
-    def set_pending_session_pick(self, user_id: int, enabled: bool) -> None:
-        user_data = self.get_user(user_id)
-        user_data["pending_session_pick"] = bool(enabled)
-        self.save()
+    def set_pending_session_pick(self, user_id: StateActor, enabled: bool) -> None:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            user_data["pending_session_pick"] = bool(enabled)
+            self._save_unlocked()
 
-    def is_pending_session_pick(self, user_id: int) -> bool:
-        user_data = self.get_user(user_id)
-        return bool(user_data.get("pending_session_pick"))
+    def is_pending_session_pick(self, user_id: StateActor) -> bool:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            return bool(user_data.get("pending_session_pick"))
+
+    def update_active_session_if_unchanged(
+        self,
+        user_id: StateActor,
+        expected_session_id: Optional[str],
+        next_session_id: str,
+        cwd: str,
+    ) -> bool:
+        with self._lock:
+            user_data = self._get_user_unlocked(user_id)
+            current_session_id = self._normalize_session_id(user_data.get("active_session_id"))
+            if current_session_id != self._normalize_session_id(expected_session_id):
+                return False
+            user_data["active_session_id"] = next_session_id
+            user_data["active_cwd"] = cwd
+            self._save_unlocked()
+            return True
+
+
+class RunningPromptRegistry:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._running_counts: Dict[str, int] = {}
+        self._running_sessions: Dict[str, Set[str]] = {}
+
+    @staticmethod
+    def _actor_key(actor: StateActor) -> str:
+        return str(actor)
+
+    def try_start(self, actor: StateActor, session_id: Optional[str]) -> bool:
+        actor_key = self._actor_key(actor)
+        normalized_session_id = BotState._normalize_session_id(session_id)
+        with self._lock:
+            if normalized_session_id:
+                sessions = self._running_sessions.setdefault(actor_key, set())
+                if normalized_session_id in sessions:
+                    return False
+                sessions.add(normalized_session_id)
+            self._running_counts[actor_key] = self._running_counts.get(actor_key, 0) + 1
+            return True
+
+    def finish(self, actor: StateActor, session_id: Optional[str]) -> None:
+        actor_key = self._actor_key(actor)
+        normalized_session_id = BotState._normalize_session_id(session_id)
+        with self._lock:
+            current_count = self._running_counts.get(actor_key, 0)
+            if current_count <= 1:
+                self._running_counts.pop(actor_key, None)
+            elif current_count > 1:
+                self._running_counts[actor_key] = current_count - 1
+
+            if normalized_session_id:
+                sessions = self._running_sessions.get(actor_key)
+                if sessions is not None:
+                    sessions.discard(normalized_session_id)
+                    if not sessions:
+                        self._running_sessions.pop(actor_key, None)
+
+    def count(self, actor: StateActor) -> int:
+        actor_key = self._actor_key(actor)
+        with self._lock:
+            return self._running_counts.get(actor_key, 0)
 
 
 class CodexRunner:
@@ -462,16 +550,44 @@ class CodexRunner:
         sandbox_mode: Optional[str] = None,
         approval_policy: Optional[str] = None,
         dangerous_bypass_level: int = 0,
+        idle_timeout_sec: int = 3600,
     ):
         self.codex_bin = codex_bin
         self.sandbox_mode = sandbox_mode
         self.approval_policy = approval_policy
         self.dangerous_bypass_level = max(0, min(2, int(dangerous_bypass_level)))
+        self.idle_timeout_sec = max(0, int(idle_timeout_sec))
 
     @staticmethod
     def _to_toml_string(value: str) -> str:
         escaped = value.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
+
+    @staticmethod
+    def _terminate_process_tree(proc: subprocess.Popen[str], force: bool = False) -> None:
+        sig = signal.SIGKILL if force else signal.SIGTERM
+        try:
+            os.killpg(proc.pid, sig)
+            return
+        except Exception:
+            pass
+        try:
+            if force:
+                proc.kill()
+            else:
+                proc.terminate()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _close_process_pipes(proc: subprocess.Popen[str]) -> None:
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is None:
+                continue
+            try:
+                pipe.close()
+            except Exception:
+                pass
 
     def run_prompt(
         self,
@@ -514,27 +630,79 @@ class CodexRunner:
             proc = subprocess.Popen(
                 cmd,
                 cwd=str(cwd),
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
+                start_new_session=True,
             )
         except FileNotFoundError as e:
             return None, f"找不到 codex 可执行文件: {self.codex_bin}", str(e), 127
 
         stdout_lines: List[str] = []
         stderr_chunks: List[str] = []
+        activity_lock = threading.Lock()
+        last_output_at = [time.monotonic()]
+
+        def mark_output() -> None:
+            with activity_lock:
+                last_output_at[0] = time.monotonic()
 
         def _collect_stderr() -> None:
             if proc.stderr is None:
                 return
-            for line in proc.stderr:
-                stderr_chunks.append(line)
+            try:
+                for line in proc.stderr:
+                    mark_output()
+                    stderr_chunks.append(line)
+            except Exception:
+                return
 
         stderr_thread: Optional[threading.Thread] = None
         if proc.stderr is not None:
             stderr_thread = threading.Thread(target=_collect_stderr, daemon=True)
             stderr_thread.start()
+
+        timed_out = threading.Event()
+
+        def _watchdog() -> None:
+            if self.idle_timeout_sec <= 0:
+                return
+            while proc.poll() is None:
+                time.sleep(5)
+                with activity_lock:
+                    idle_for_sec = time.monotonic() - last_output_at[0]
+                if idle_for_sec < self.idle_timeout_sec:
+                    continue
+                timed_out.set()
+                log(
+                    "codex exec idle timed out: "
+                    f"pid={proc.pid} idle_timeout_sec={self.idle_timeout_sec} "
+                    f"idle_for_sec={int(idle_for_sec)} cwd={cwd}"
+                )
+                try:
+                    self._terminate_process_tree(proc, force=False)
+                    proc.wait(timeout=5)
+                    self._close_process_pipes(proc)
+                    return
+                except subprocess.TimeoutExpired:
+                    pass
+                except Exception:
+                    return
+                try:
+                    self._terminate_process_tree(proc, force=True)
+                    proc.wait(timeout=2)
+                except Exception:
+                    return
+                finally:
+                    self._close_process_pipes(proc)
+                return
+
+        watchdog_thread: Optional[threading.Thread] = None
+        if self.idle_timeout_sec > 0:
+            watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+            watchdog_thread.start()
 
         thread_id: Optional[str] = None
         messages: List[str] = []
@@ -542,32 +710,38 @@ class CodexRunner:
         last_emitted = ""
 
         if proc.stdout is not None:
-            for raw_line in proc.stdout:
-                stdout_lines.append(raw_line.rstrip("\n"))
-                line = raw_line.strip()
-                if not line or not line.startswith("{"):
-                    continue
-                try:
-                    evt = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                evt_thread_id, messages, current_agent_text, changed = self._consume_exec_event(
-                    evt,
-                    messages,
-                    current_agent_text,
-                )
-                if evt_thread_id and not thread_id:
-                    thread_id = evt_thread_id
-                if on_update and changed:
-                    live_text = self._compose_agent_text(messages, current_agent_text)
-                    if live_text and live_text != last_emitted:
-                        try:
-                            on_update(live_text)
-                        except Exception:
-                            pass
-                        last_emitted = live_text
+            try:
+                for raw_line in proc.stdout:
+                    mark_output()
+                    stdout_lines.append(raw_line.rstrip("\n"))
+                    line = raw_line.strip()
+                    if not line or not line.startswith("{"):
+                        continue
+                    try:
+                        evt = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    evt_thread_id, messages, current_agent_text, changed = self._consume_exec_event(
+                        evt,
+                        messages,
+                        current_agent_text,
+                    )
+                    if evt_thread_id and not thread_id:
+                        thread_id = evt_thread_id
+                    if on_update and changed:
+                        live_text = self._compose_agent_text(messages, current_agent_text)
+                        if live_text and live_text != last_emitted:
+                            try:
+                                on_update(live_text)
+                            except Exception:
+                                pass
+                            last_emitted = live_text
+            except Exception:
+                pass
 
         return_code = proc.wait()
+        if watchdog_thread is not None:
+            watchdog_thread.join(timeout=0.2)
         if stderr_thread is not None:
             stderr_thread.join(timeout=2.0)
         stderr_text = "".join(stderr_chunks).strip()
@@ -591,6 +765,15 @@ class CodexRunner:
                 agent_text = merged[-3500:]
             else:
                 agent_text = "Codex 没有返回可展示内容。"
+        if timed_out.is_set():
+            timeout_text = (
+                f"Codex 长时间无输出（>{self.idle_timeout_sec}s），"
+                "进程已被终止。通常是卡在外部命令、网络请求、远端连接或等待输入。"
+            )
+            if agent_text and agent_text != "Codex 没有返回可展示内容。":
+                agent_text = f"{timeout_text}\n\n{agent_text}"
+            else:
+                agent_text = timeout_text
         return thread_id, agent_text, stderr_text, return_code
 
     @staticmethod
@@ -736,6 +919,7 @@ class TgCodexService:
         self.stream_edit_interval_ms = max(200, stream_edit_interval_ms)
         self.stream_min_delta_chars = max(1, stream_min_delta_chars)
         self.thinking_status_interval_ms = max(400, thinking_status_interval_ms)
+        self.running_prompts = RunningPromptRegistry()
         self.offset: Optional[int] = None
 
     def run_forever(self) -> None:
@@ -873,6 +1057,7 @@ class TgCodexService:
                     "/ask <内容> - 手动提问（可选）",
                     "执行 /sessions 后，可直接发送编号切换会话",
                     "执行 /sessions 后，也可点击按钮直接切换会话",
+                    "后台执行时仍可发送 /use /sessions /status",
                     "直接发普通消息即可对话（会自动续聊当前 session）",
                 ]
             ),
@@ -1023,10 +1208,14 @@ class TgCodexService:
 
     def _handle_status(self, chat_id: int, reply_to: int, user_id: int) -> None:
         session_id, cwd = self.state.get_active(user_id)
+        running_count = self.running_prompts.count(user_id)
         if not session_id:
+            message = "当前没有绑定会话。可先 /sessions + /use，或 /new 后直接发消息。"
+            if running_count > 0:
+                message += f"\n后台仍有 {running_count} 个任务运行，可继续 /use 切线程。"
             self.api.send_message(
                 chat_id,
-                "当前没有绑定会话。可先 /sessions + /use，或 /new 后直接发消息。",
+                message,
                 reply_to=reply_to,
             )
             return
@@ -1034,9 +1223,18 @@ class TgCodexService:
         meta = self.sessions.find_by_id(session_id)
         if meta:
             title = meta.title
+        lines = [
+            "当前会话:",
+            title,
+            f"session: {session_id}",
+            f"cwd: {cwd or str(self.default_cwd)}",
+            "支持与本地 Codex 客户端交替续聊。",
+        ]
+        if running_count > 0:
+            lines.append(f"后台运行中: {running_count} 个任务（可继续 /use 切线程）")
         self.api.send_message(
             chat_id,
-            f"当前会话:\n{title}\nsession: {session_id}\ncwd: {cwd or str(self.default_cwd)}\n支持与本地 Codex 客户端交替续聊。",
+            "\n".join(lines),
             reply_to=reply_to,
         )
 
@@ -1067,6 +1265,31 @@ class TgCodexService:
 
     def _handle_chat_message(self, chat_id: int, reply_to: int, user_id: int, text: str) -> None:
         self._run_prompt(chat_id, reply_to, user_id, text)
+
+    def _session_label(self, session_id: Optional[str], cwd: Path) -> str:
+        resolved_cwd = cwd
+        if session_id:
+            meta = self.sessions.find_by_id(session_id)
+            title = meta.title if meta else f"session {session_id[:8]}"
+            if meta and meta.cwd:
+                resolved_cwd = Path(meta.cwd)
+        else:
+            title = "新会话"
+        cwd_name = resolved_cwd.name or str(resolved_cwd)
+        if session_id:
+            return f"{title} | {session_id[:8]} | {cwd_name}"
+        return f"{title} | {cwd_name}"
+
+    def _initial_prompt_status(self, session_label: str, active_id: Optional[str], elapsed: Optional[int] = None) -> str:
+        body = "思考中..."
+        if elapsed is not None:
+            body = f"{body}\n\n已等待 {elapsed}s"
+        return self._format_prompt_response(session_label, body)
+
+    @staticmethod
+    def _format_prompt_response(session_label: str, text: str) -> str:
+        body = (text or "Codex 没有返回可展示内容。").strip() or "Codex 没有返回可展示内容。"
+        return f"[{session_label}]\n\n{body}"
 
     @staticmethod
     def _stream_preview_text(text: str) -> str:
@@ -1133,9 +1356,46 @@ class TgCodexService:
         cwd = Path(active_cwd).expanduser() if active_cwd else self.default_cwd
         if not cwd.exists():
             cwd = self.default_cwd
+        if not self.running_prompts.try_start(user_id, active_id):
+            busy_session = active_id[:8] if active_id else "当前线程"
+            self.api.send_message(
+                chat_id,
+                f"会话 {busy_session} 已有任务运行中。可先 /use 切到其他线程，或等待当前回复完成。",
+                reply_to=reply_to,
+            )
+            return
 
+        session_label = self._session_label(active_id, cwd)
         mode = "继续当前会话" if active_id else "新建会话"
-        log(f"run prompt: user_id={user_id} mode={mode} cwd={cwd} session={active_id}")
+        log(f"queue prompt: user_id={user_id} mode={mode} cwd={cwd} session={active_id}")
+        if not self.stream_enabled:
+            self.api.send_message(
+                chat_id,
+                f"已开始处理 [{session_label}]。\n可继续发送 /use、/sessions、/status。",
+                reply_to=reply_to,
+            )
+
+        worker = threading.Thread(
+            target=self._run_prompt_worker,
+            args=(chat_id, reply_to, user_id, prompt, active_id, cwd, session_label),
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except Exception:
+            self.running_prompts.finish(user_id, active_id)
+            raise
+
+    def _run_prompt_worker(
+        self,
+        chat_id: int,
+        reply_to: int,
+        user_id: int,
+        prompt: str,
+        active_id: Optional[str],
+        cwd: Path,
+        session_label: str,
+    ) -> None:
         stream_message_id: Optional[int] = None
         stream_lock = threading.Lock()
         thinking_stop = threading.Event()
@@ -1146,6 +1406,8 @@ class TgCodexService:
             "last_emit_at_ms": 0,
             "content_updates": 0,
         }
+        run_started_at = time.time()
+        first_output_at: List[float] = []
 
         def edit_stream_message(text: str) -> bool:
             nonlocal stream_message_id
@@ -1165,7 +1427,11 @@ class TgCodexService:
 
         if self.stream_enabled:
             try:
-                sent = self.api.send_message_with_result(chat_id, "思考中...", reply_to=reply_to)
+                sent = self.api.send_message_with_result(
+                    chat_id,
+                    self._initial_prompt_status(session_label, active_id),
+                    reply_to=reply_to,
+                )
                 msg_id = sent.get("message_id")
                 if isinstance(msg_id, int):
                     stream_message_id = msg_id
@@ -1180,7 +1446,10 @@ class TgCodexService:
                 if first_output.is_set():
                     return
                 elapsed = int(time.time() - start_ts)
-                status_text = f"{phases[i % len(phases)]}\n\n已等待 {elapsed}s"
+                status_text = self._format_prompt_response(
+                    session_label,
+                    f"{phases[i % len(phases)]}\n\n已等待 {elapsed}s",
+                )
                 i += 1
                 if not edit_stream_message(status_text):
                     return
@@ -1191,9 +1460,14 @@ class TgCodexService:
 
         def on_update(live_text: str) -> None:
             first_output.set()
+            if not first_output_at:
+                first_output_at.append(time.time())
             if stream_message_id is None:
                 return
-            preview = self._stream_preview_text(live_text)
+            preview = self._format_prompt_response(
+                session_label,
+                self._stream_preview_text(live_text),
+            )
             now_ms = int(time.time() * 1000)
             last_preview = str(stream_state.get("last_preview") or "")
             last_emit_at_ms = int(stream_state.get("last_emit_at_ms") or 0)
@@ -1223,7 +1497,10 @@ class TgCodexService:
             thinking_stop.set()
             if thinking_thread is not None:
                 thinking_thread.join(timeout=0.3)
-            err_msg = f"调用 Codex 时出现异常: {e}"
+            err_msg = self._format_prompt_response(
+                session_label,
+                f"调用 Codex 时出现异常: {e}",
+            )
             if stream_message_id is not None:
                 self._finalize_stream_reply(chat_id, reply_to, stream_message_id, err_msg, progressive_replay=False)
             else:
@@ -1234,20 +1511,47 @@ class TgCodexService:
             if thinking_thread is not None:
                 thinking_thread.join(timeout=0.3)
             typing.stop()
+            self.running_prompts.finish(user_id, active_id)
 
+        elapsed_sec = round(time.time() - run_started_at, 2)
+        first_output_sec = round(first_output_at[0] - run_started_at, 2) if first_output_at else None
+        log(
+            "prompt finished: "
+            f"user_id={user_id} session={active_id} thread={thread_id} exit={return_code} "
+            f"elapsed_sec={elapsed_sec} first_output_sec={first_output_sec}"
+        )
+
+        final_session_id = thread_id or active_id
+        final_session_label = self._session_label(final_session_id, cwd)
+        session_updated = False
         if thread_id:
-            self.state.set_active_session(user_id, thread_id, str(cwd))
+            session_updated = self.state.update_active_session_if_unchanged(
+                user_id,
+                active_id,
+                thread_id,
+                str(cwd),
+            )
 
         if return_code != 0:
             msg = f"Codex 执行失败 (exit={return_code})\n{answer}"
             if stderr_text:
                 msg += f"\n\nstderr:\n{stderr_text[-1200:]}"
+            msg = self._format_prompt_response(final_session_label, msg)
             if stream_message_id is not None:
                 self._finalize_stream_reply(chat_id, reply_to, stream_message_id, msg, progressive_replay=False)
             else:
                 self.api.send_message(chat_id, msg, reply_to=reply_to)
             return
 
+        if thread_id and not session_updated:
+            current_active_id, _ = self.state.get_active(user_id)
+            if current_active_id != thread_id:
+                note = "当前活动线程未变；这是后台线程的回复。"
+                if not active_id:
+                    note = "新线程已创建，但你已经切到别的线程，当前活动线程未变。"
+                answer = f"{note}\n\n{answer}"
+
+        answer = self._format_prompt_response(final_session_label, answer)
         if stream_message_id is not None:
             replay = int(stream_state.get("content_updates") or 0) == 0
             self._finalize_stream_reply(chat_id, reply_to, stream_message_id, answer, progressive_replay=replay)
@@ -1280,6 +1584,10 @@ def build_service() -> TgCodexService:
     codex_sandbox_mode = env("CODEX_SANDBOX_MODE")
     codex_approval_policy = env("CODEX_APPROVAL_POLICY")
     codex_dangerous_bypass_level = parse_dangerous_bypass_level(env("CODEX_DANGEROUS_BYPASS", "0"))
+    codex_idle_timeout_sec = parse_non_negative_int(
+        env("CODEX_IDLE_TIMEOUT_SEC", env("CODEX_EXEC_TIMEOUT_SEC", "3600")),
+        3600,
+    )
     default_cwd = Path(env("DEFAULT_CWD", os.getcwd())).expanduser()
     ca_bundle = env("TELEGRAM_CA_BUNDLE")
     insecure_skip_verify = env("TELEGRAM_INSECURE_SKIP_VERIFY", "0") == "1"
@@ -1300,6 +1608,7 @@ def build_service() -> TgCodexService:
         sandbox_mode=codex_sandbox_mode,
         approval_policy=codex_approval_policy,
         dangerous_bypass_level=codex_dangerous_bypass_level,
+        idle_timeout_sec=codex_idle_timeout_sec,
     )
     if codex_dangerous_bypass_level == 1:
         log("[warn] CODEX_DANGEROUS_BYPASS=1, enabling sandbox_mode=danger-full-access and approval_policy=never")
@@ -1314,6 +1623,10 @@ def build_service() -> TgCodexService:
         )
     else:
         log("[info] TG streaming disabled")
+    if codex_idle_timeout_sec > 0:
+        log(f"[info] Codex idle timeout enabled ({codex_idle_timeout_sec}s)")
+    else:
+        log("[warn] Codex idle timeout disabled")
 
     return TgCodexService(
         api=api,
